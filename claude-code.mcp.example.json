@@ -1,0 +1,15 @@
+{
+  "_comment": "Для Claude Code: сохрани как .mcp.json в папке проекта (например, Documents\\tinvest). Токены подставятся из переменных окружения, в файл они не попадают.",
+  "mcpServers": {
+    "t-invest": {
+      "type": "http",
+      "url": "https://invest-public-api.tbank.ru/mcp",
+      "headers": { "Authorization": "Bearer ${T_INVEST_IIS_READ}" }
+    },
+    "t-invest-sandbox": {
+      "type": "http",
+      "url": "https://sandbox-invest-public-api.tbank.ru/mcp",
+      "headers": { "Authorization": "Bearer ${T_INVEST_SANDBOX}" }
+    }
+  }
+}
