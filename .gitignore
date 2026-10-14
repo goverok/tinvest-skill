@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.env
+*.zip
+data/
+data-sandbox/
+reports/
+reports-sandbox/
+history/
+raw/
+mcp_extra.json
+ca-bundle.pem
