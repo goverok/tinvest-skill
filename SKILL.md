@@ -76,5 +76,5 @@ Python — из окружения `~/.tinvest/venv` (создаётся при 
 - `scripts/tinvest_api.py` — REST-клиент. `scripts/model.py` — чтение выгрузки, оценка позиций в ₽, внешние потоки, сделки для FIFO.
 - `scripts/finmath.py` — XIRR, YTM, дюрация, FIFO, размещение по долям (покрыто `tests/test_calc.py`).
 - `scripts/audit.py`, `perf.py`, `bonds.py`, `events.py`, `tax.py`, `deploy.py` — отчёты.
-- `scripts/make_ca_bundle.py` — CA-бандл с сертификатами Минцифры. `scripts/sandbox.py` — виртуальные счета песочницы (REST). `scripts/mcp_ingest.py` — сборка данных из ответов MCP.
+- `scripts/make_ca_bundle.py` — CA-бандл с сертификатами Минцифры. `scripts/sandbox.py` — виртуальные счета песочницы (REST). `scripts/backtest.py [--fund TMOS|SBMX] [--refresh]` — бэктест тренд-фильтра IMOEX/SMA → фонд на индекс / LQDT с комиссиями, проскальзыванием, налогом и walk-forward (отчёт `~/.tinvest/reports/backtest_trend.md`). `scripts/mcp_ingest.py` — сборка данных из ответов MCP.
 - `targets.example.yaml` → `~/.tinvest/targets.yaml` — целевые доли для deploy. `.env.example` → `~/.tinvest/.env`.

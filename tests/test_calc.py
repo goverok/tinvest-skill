@@ -132,10 +132,64 @@ def test_reports():
     print("reports ok")
 
 
+def _bar(d, ro, rc, so, sc):
+    return {"date": d, "risk_open": ro, "risk_close": rc, "safe_open": so, "safe_close": sc}
+
+
+def test_backtest():
+    from backtest import align_states, max_drawdown, simulate, trend_states
+    # SMA(3): прогрев -> None; 10 = SMA -> не выше -> вне рынка; 13 > 11 -> в рынке; 7 < 10 -> вне
+    assert trend_states([10, 10, 10, 13, 7], 3, 0.0) == [None, None, False, True, False]
+    # гистерезис: 11.5 == SMA 11.5 -> не ниже, остаёмся в рынке
+    assert trend_states([10, 10, 10, 13, 11.5], 3, 0.0)[-1] is True
+    # полоса 10%: вход только выше SMA·1.1, выход только ниже SMA·0.9
+    assert trend_states([10, 10, 10, 11.5, 9.5], 3, 0.1) == [None, None, False, False, False]  # 11.5 < 10.5·1.1
+    assert trend_states([10, 10, 10, 13, 9.9], 3, 0.1) == [None, None, False, True, True]  # 9.9 > 10.97·0.9
+    assert trend_states([10, 10, 10, 13, 9.9], 3, 0.0)[-1] is False
+    # сигнал берётся с последнего закрытия индекса строго ДО даты бара; прогрев = вне рынка
+    idx_d = [date(2024, 1, 1), date(2024, 1, 2), date(2024, 1, 4)]
+    assert align_states(idx_d, [None, True, False], [date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4), date(2024, 1, 5)])         == [False, True, True, False]
+    assert close(max_drawdown([100, 120, 90, 130, 65]), -0.5)
+
+    # без переключений, ИИС: покупка по open с проскальзыванием и комиссией, продажа в конце по close
+    bars = [_bar(date(2024, 1, d), 10, 10, 1.0, 1.0) for d in (1, 2, 3)]
+    r = simulate(bars, [False] * 3, capital=1000.0, cost=0.0005, slip=0.001)
+    assert close(r["final"], 1000 * 0.999 * 0.9995 / (1.001 * 1.0005), 1e-9), r["final"]
+    assert r["switches"] == 0 and r["taxes"] == 0.0
+
+    # переключение без издержек: 1000 в safe @1 -> продали @1.1 = 1100 -> 110 risk @10 -> close 12 = 1320
+    bars = [_bar(date(2024, 1, 1), 10, 10, 1.0, 1.0), _bar(date(2024, 1, 2), 10, 11, 1.1, 1.1),
+            _bar(date(2024, 1, 3), 11, 12, 1.1, 1.1)]
+    r = simulate(bars, [False, True, True], capital=1000.0, cost=0.0, slip=0.0)
+    assert close(r["final"], 1320.0) and r["switches"] == 1
+    assert close(r["equity"][1][1], 110 * 11) and r["in_market"] == [False, True, True]
+
+    # брокерский счёт: прибыль 2020 = 200 -> налог 26 в первый день 2021 продажей 2.6 паёв @10
+    bars = [_bar(date(2020, 1, 10), 10, 10, 1.0, 1.0), _bar(date(2020, 6, 1), 10, 10, 1.2, 1.2),
+            _bar(date(2021, 1, 11), 10, 10, 1.2, 1.2), _bar(date(2021, 2, 1), 10, 10, 1.2, 1.2)]
+    r = simulate(bars, [False, True, True, True], capital=1000.0, cost=0.0, slip=0.0, tax_rate=0.13)
+    assert close(r["taxes"], 26.0) and close(r["final"], 1174.0), r
+
+    # перенос убытка: 2020 −200, 2021 +400 -> налог 13% с 200
+    bars = [_bar(date(2020, 1, 10), 10, 10, 1.0, 1.0), _bar(date(2020, 6, 1), 10, 10, 0.8, 0.8),
+            _bar(date(2021, 3, 1), 10, 15, 0.8, 0.8)]
+    r = simulate(bars, [False, True, True], capital=1000.0, cost=0.0, slip=0.0, tax_rate=0.13)
+    assert close(r["taxes"], 26.0) and close(r["final"], 1174.0), r
+
+    # ЛДВ: держали дольше 3 лет -> налога нет; чуть меньше 3 лет -> 13% с прибыли
+    hold = lambda end: [_bar(date(2020, 1, 10), 10, 10, 1.0, 1.0), _bar(end, 10, 10, 2.0, 2.0)]  # noqa: E731
+    r = simulate(hold(date(2023, 1, 10)), [False, False], capital=1000.0, cost=0.0, slip=0.0, tax_rate=0.13)
+    assert close(r["final"], 2000.0) and r["taxes"] == 0.0, r
+    r = simulate(hold(date(2022, 12, 30)), [False, False], capital=1000.0, cost=0.0, slip=0.0, tax_rate=0.13)
+    assert close(r["final"], 1870.0), r
+    print("backtest ok")
+
+
 if __name__ == "__main__":
     test_xirr()
     test_ytm_duration()
     test_fifo()
     test_allocate()
     test_reports()
+    test_backtest()
     print("ALL OK")

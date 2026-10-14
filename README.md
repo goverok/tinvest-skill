@@ -28,6 +28,8 @@
 
 Песочница (ступень 3) через REST: `scripts/sandbox.py accounts | open | payin <id> <сумма> | close <id>` — использует только `T_INVEST_SANDBOX`.
 
+Бэктест тренд-фильтра (IMOEX выше SMA200 — TMOS, ниже — LQDT): `scripts/backtest.py [--fund TMOS|SBMX] [--refresh]` — комиссия 0,05%, проскальзывание 0,1%, ИИС и брокерский счёт (13%, ЛДВ), walk-forward; отчёт в `~/.tinvest/reports/backtest_trend.md`.
+
 Тесты математики на синтетических данных: `~/.tinvest/venv/bin/python tests/test_calc.py`.
 
 ## Что где лежит
