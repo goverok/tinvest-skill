@@ -1,0 +1,69 @@
+name: tinvest brief
+
+on:
+  schedule:
+    - cron: "45 5 * * 1-5"   # 08:45 МСК, будни — бриф
+    - cron: "30 15 * * 1-5"  # 18:30 МСК, будни — только алерты
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "brief | alerts | check"
+        default: "brief"
+
+permissions:
+  contents: read
+
+jobs:
+  brief:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TINVEST_HOME: ${{ github.workspace }}/.tinvest
+      T_INVEST_IIS_READ: ${{ secrets.T_INVEST_IIS_READ }}
+      T_INVEST_TG_BOT: ${{ secrets.T_INVEST_TG_BOT }}
+      T_INVEST_TG_CHAT: ${{ secrets.T_INVEST_TG_CHAT }}
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -q -r requirements.txt
+
+      - name: Сертификаты Минцифры
+        run: |
+          mkdir -p "$TINVEST_HOME/certs"
+          curl -fsSL -o "$TINVEST_HOME/certs/root.crt" https://gu-st.ru/content/lending/russian_trusted_root_ca_pem.crt
+          curl -fsSL -o "$TINVEST_HOME/certs/sub.crt"  https://gu-st.ru/content/lending/russian_trusted_sub_ca_pem.crt
+          python scripts/make_ca_bundle.py "$TINVEST_HOME/certs/root.crt" "$TINVEST_HOME/certs/sub.crt"
+          echo "TINVEST_CA_BUNDLE=$TINVEST_HOME/ca-bundle.pem" >> "$GITHUB_ENV"
+
+      - name: Снимки прошлых дней (кэш)
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.tinvest/history
+          key: tinvest-history-${{ github.run_id }}
+          restore-keys: tinvest-history-
+
+      - name: Пороги алертов
+        run: cp alerts.example.yaml "$TINVEST_HOME/alerts.yaml"
+
+      - name: Режим
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then m="${{ github.event.inputs.mode }}"
+          elif [ "${{ github.event.schedule }}" = "30 15 * * 1-5" ]; then m="alerts"
+          else m="brief"; fi
+          echo "mode=$m" >> "$GITHUB_OUTPUT"
+
+      - name: Проверка токена
+        if: steps.mode.outputs.mode == 'check'
+        run: python scripts/report.py check
+
+      - name: Бриф
+        if: steps.mode.outputs.mode == 'brief'
+        run: python scripts/brief.py --send
+
+      - name: Только алерты
+        if: steps.mode.outputs.mode == 'alerts'
+        run: python scripts/brief.py --send --alerts-only
