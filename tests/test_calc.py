@@ -636,6 +636,28 @@ def test_bt_protocol():
     print("bt_protocol ok")
 
 
+def test_research_report():
+    import research
+    d0 = date(2014, 1, 1)
+    n = 700
+    series = {"IMOEX": _series("IMOEX", d0, [100 + i * 0.05 for i in range(n)]),
+              "LQDT": _series("LQDT", d0, [1 + i * 0.0002 for i in range(n)]),
+              "TMOS": _series("TMOS", d0, [5 + i * 0.002 for i in range(n)]),
+              "A": _series("A", d0, [10 + i * 0.02 for i in range(n)]),
+              "B": _series("B", d0, [10 + (i % 7) * 0.1 for i in range(n)]),
+              "C": _series("C", d0, [20 - i * 0.01 for i in range(n)])}
+    end = series["A"]["dates"][-1]
+    windows = {"TRAIN": (d0, series["A"]["dates"][400]), "VALID": (series["A"]["dates"][401], end)}
+    text, data = research.train_report(series, ["trend_vol"], n_random=3, capital=1000.0, windows=windows, universe=["A", "B", "C"])
+    assert "## trend_vol" in text and "Финалист" in text and "Валидация" in text and "Устойчивость" in text, text[:500]
+    assert data["trend_vol"]["finalist"] in [{"N": n_, "target_vol": v} for n_ in (50, 100, 200) for v in (0.1, 0.15, 0.2)]
+    text, data = research.holdout_report(series, [("trend_vol", data["trend_vol"]["finalist"])], capital=1000.0,
+                                         violations=["trend_vol: тест"], window=(series["A"]["dates"][401], end),
+                                         valid_mdd={"trend_vol": -0.1}, universe=["A", "B", "C"])
+    assert text.startswith("# ") and "Нарушение протокола" in text and "Вердикт" in text and data["verdict"] in (1, 2, 3)
+    print("research ok")
+
+
 if __name__ == "__main__":
     test_xirr()
     test_ytm_duration()
@@ -648,4 +670,5 @@ if __name__ == "__main__":
     test_bt_sim()
     test_bt_strategies()
     test_bt_protocol()
+    test_research_report()
     print("ALL OK")

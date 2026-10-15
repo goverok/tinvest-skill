@@ -53,6 +53,7 @@ report.py tax                   FIFO-лоты, ЛДВ, убытки под са�
 report.py deploy 400000         план покупок в лотах под targets.yaml, без продаж
 report.py all                   audit + tax по всем счетам
 fetch.py [--sandbox] [--targets ~/.tinvest/targets.yaml]   выгрузка данных
+research.py fetch|train|holdout <финалисты>|all   исследование стратегий (см. SKILL.md)
 ```
 
 Данные обновляются сами, если выгрузке больше 12 часов; `--refresh` обновляет принудительно.
