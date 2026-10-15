@@ -241,6 +241,11 @@ def test_bt_data():
     s = make_series("X", _candles(date(2024, 1, 1), [100.0, 110.0, 120.0, 12.0]), splits=[("2024-01-04", 10)], dividends=div)
     assert len(s["divs"]) == 1 and s["divs"][0]["ex"] == date(2024, 1, 3) and close(s["divs"][0]["amount"], 1.0), s["divs"]
     assert close(s["tr"][1], 1.1) and close(s["tr"][2], 1.1 * 13 / 11) and close(s["tr"][3], s["tr"][2])
+    # до перехода на T+1 (2023-07-31) ex-день — сам бар lastBuyDate: гэп 2020-01-02 с 110 до 100 при дивиденде 10 -> tr не меняется
+    old = [{"dividendNet": {"units": "10", "nano": 0}, "lastBuyDate": "2020-01-02T00:00:00Z",
+            "recordDate": "2020-01-03T00:00:00Z", "paymentDate": "2020-01-10T00:00:00Z"}]
+    s = make_series("X", _candles(date(2020, 1, 1), [110.0, 100.0, 100.0]), dividends=old)
+    assert s["divs"][0]["ex"] == date(2020, 1, 2) and close(s["tr"][1], 1.0) and close(s["tr"][2], 1.0), (s["divs"], s["tr"])
     # качество: разрыв > 7 дней, нулевой объём, скачок > 30% без сплита
     c = _candles(date(2024, 1, 1), [10.0, 10.0, 14.0])
     c[2]["time"] = "2024-01-20T00:00:00Z"

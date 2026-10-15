@@ -41,6 +41,10 @@ KEY_RATE: List[Tuple[date, float]] = [
 ]
 SAFE_SPREAD = 0.005  # LQDT ≈ RUONIA ≈ ключевая − 0.5 п.п.
 HISTORY_FROM = date(2013, 1, 1)  # год прогрева перед TRAIN
+# Переход MOEX на расчёты T+1. API отдаёт lastBuyDate = recordDate − 1 рабочий день для всех дивидендов, но при T+2
+# последний день покупки был на день раньше, т.е. реальная ex-дата (первый бар без дивиденда) = бар на lastBuyDate.
+# Проверено по гэпам: до перехода 240 из 253 событий ≥ 2% гэпуют на баре lastBuyDate, после — 85 из 87 на следующем.
+T1_SETTLEMENT_FROM = date(2023, 7, 31)
 PAUSE_2022 = (date(2022, 2, 25), date(2022, 3, 31))
 # окрестность обвала и паузы 2022: скачки здесь — рынок, а не неучтённый сплит
 CRASH_2022 = (date(2022, 2, 21), date(2022, 4, 8))
@@ -59,7 +63,7 @@ def _split_factor(d: date, splits: Sequence[Tuple[str, float]]) -> float:
 def make_series(ticker: str, candles: Sequence[Dict[str, Any]], lot: int = 1,
                 splits: Sequence[Tuple[str, float]] = (), dividends: Sequence[Dict[str, Any]] = ()) -> Series:
     """Свечи API -> серия с поправкой на сплиты и индексом полной доходности. Дивиденд попадает в tr в день ex
-    (первый торговый день после lastBuyDate), amount приводится к масштабу после сплита."""
+    (бар lastBuyDate до T1_SETTLEMENT_FROM, первый бар после — начиная с него), amount приводится к масштабу после сплита."""
     rows = sorted(((parse_date(c["time"]), c) for c in candles if c.get("close") and c.get("open")),
                   key=lambda r: r[0])
     s: Series = {"ticker": ticker, "lot": lot, "dates": [], "open": [], "high": [], "low": [], "close": [],
@@ -82,7 +86,10 @@ def make_series(ticker: str, candles: Sequence[Dict[str, Any]], lot: int = 1,
         pay = parse_date(dv.get("paymentDate")) or last_buy
         if not last_buy or not s["dates"]:
             continue
-        i = bisect.bisect_right(s["dates"], last_buy)
+        if last_buy < T1_SETTLEMENT_FROM:
+            i = bisect.bisect_left(s["dates"], last_buy)  # T+2: ex-день — сам бар lastBuyDate
+        else:
+            i = bisect.bisect_right(s["dates"], last_buy)  # T+1: первый бар после lastBuyDate
         if i >= len(s["dates"]):
             continue  # отсечка позже последней свечи — в истории не участвует
         ex = s["dates"][i]
