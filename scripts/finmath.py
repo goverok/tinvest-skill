@@ -192,7 +192,7 @@ def sharpe(returns: Sequence[float], rf: Optional[Sequence[float]] = None, perio
     if len(ex) < 2:
         return None
     m, sd, _, _ = moments(ex)
-    if sd == 0:
+    if sd <= 1e-12 * max(1.0, abs(m)):  # нулевая дисперсия с поправкой на ошибку округления среднего
         return None
     return m / sd * math.sqrt(periods)
 

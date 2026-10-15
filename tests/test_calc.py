@@ -197,6 +197,11 @@ def test_sharpe():
     assert close(sharpe([0.02, 0.0] * 5, [0.01] * 10), 0.0, 1e-9)
     # доходность равна rf -> избыточная нулевая дисперсия -> None
     assert sharpe([0.01] * 5, [0.01] * 5) is None
+    # константа без rf: среднее одинаковых float неточно, но дисперсия считается нулевой
+    assert sharpe([0.007] * 10) is None
+    assert sharpe([0.003] * 3) is None
+    # переменный rf, избыточная доходность 1% в каждом периоде -> нулевая дисперсия -> None
+    assert sharpe([0.02, 0.0, 0.03, 0.01], [0.01, -0.01, 0.02, 0.0]) is None
     m, sd, sk, ku = moments([1.0, 2.0, 3.0, 4.0, 5.0])
     assert close(m, 3.0) and close(sd, 2.5 ** 0.5) and close(sk, 0.0) and 1.5 < ku < 2.0, (m, sd, sk, ku)
     assert close(norm_cdf(0.0), 0.5) and close(norm_cdf(1.96), 0.975, 1e-3)
