@@ -339,7 +339,7 @@ def test_bt_sim():
     # кэш не уходит в минус при издержках: вес 1.0 в A с комиссией 1% -> покупается 99 шт, кэш >= 0
     r = simulate(series, lambda v, p, s: {"A": 1.0}, {}, start=d0, end=date(2024, 1, 6), capital=1000.0, cost=0.01, slip=0.0)
     first_a = next(t for t in r["trades"] if t["ticker"] == "A")
-    assert first_a["qty"] == 99 and min(e for _, e in r["equity"]) > 0, first_a
+    assert first_a["qty"] == 99 and min(e for _, e in r["equity"]) > 0 and r["cash_min"] >= 0, first_a
 
     # бумага без бара в этот день: C торгуется только 2 дня, оценка по последнему close, заявок по ней нет
     c = _series("C", d0, [3.0, 3.0])
@@ -386,11 +386,13 @@ def test_bt_sim():
     # смена года: покупка A 30.12 по 10, продажа 31.12 по 12 (прибыль 200 в 2024), снова A -> 03.01 налог 26 платится
     # принудительной продажей (кэш ~0), а не итоговым расчётом
     ydays = [date(2024, 12, 27), date(2024, 12, 30), date(2024, 12, 31), date(2025, 1, 3), date(2025, 1, 6)]
-    ysig = lambda v, p, st: {} if v.today == date(2024, 12, 30) else {"A": 1.0}  # noqa: E731
+    ysig = lambda v, p, st: {"A": 1.0} if v.today == ydays[0] else {}  # noqa: E731
     r = _tax_run(ydays, [10, 10, 12, 12, 12], ysig)
     assert close(r["taxes"], 26.0), r["taxes"]
-    assert any(t["side"] == "sell" and t["date"] == date(2025, 1, 3) for t in r["trades"]), r["trades"]
-    assert min(e for _, e in r["equity"]) > 0 and close(r["final"], 1174.0), r["final"]
+    # цель не меняется на смене года (всё в LQDT), поэтому единственная сделка 03.01 — принудительная продажа на 26
+    jan3 = [t for t in r["trades"] if t["date"] == date(2025, 1, 3)]
+    assert len(jan3) == 1 and jan3[0]["side"] == "sell" and jan3[0]["ticker"] == "LQDT" and close(jan3[0]["qty"], 26.0), jan3
+    assert r["cash_min"] >= 0 and min(e for _, e in r["equity"]) > 0 and close(r["final"], 1174.0), (r["cash_min"], r["final"])
 
     # перенос убытка: 2024 -200, 2025 +400 -> налог 0.13 * (400 - 200) = 26
     cdays = [date(2024, 12, 27), date(2024, 12, 30), date(2024, 12, 31), date(2025, 1, 3), date(2025, 1, 6),
@@ -416,7 +418,8 @@ def test_bt_sim():
     def _look(close3):
         la = _series("A", d0, [10, 10, close3, 10, 10, 10], opens=[10] * 6)
         return simulate(dict(series, A=la), lambda v, p, st: {"A": 0.5}, {}, **kw)
-    assert [t for t in _look(10)["trades"] if t["date"] <= date(2024, 1, 3)] ==         [t for t in _look(5)["trades"] if t["date"] <= date(2024, 1, 3)]
+    assert [t for t in _look(10)["trades"] if t["date"] <= date(2024, 1, 3)] == \
+        [t for t in _look(5)["trades"] if t["date"] <= date(2024, 1, 3)]
 
     # fill: сигнал на закрытии дня 2 -> open дня 3 = 10, close дня 3 = 12
     sig2 = lambda v, p, s: {"A": 1.0} if v.today == date(2024, 1, 2) else {}  # noqa: E731

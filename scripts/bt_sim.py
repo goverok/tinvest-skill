@@ -6,6 +6,9 @@
 за позиции, державшиеся на закрытии перед ex-датой, за вычетом 13 % удержания у источника в обоих режимах. Налог (tax_rate=None — ИИС): 13% с прибыли года по FIFO,
 перенос убытка, ЛДВ > 3 лет; уплата в первый торговый день следующего года, при нехватке кэша — продажей
 пропорционально по всем позициям. В конце окна — ликвидация по close.
+
+Результат simulate: equity, trades, final, costs, taxes, dividends, capital, start, end, in_stocks и
+cash_min — минимальный кэш, наблюдавшийся после налогового шага и после исполнения заявок (должен быть >= 0).
 """
 import bisect
 import math
@@ -100,6 +103,7 @@ def simulate(series: Dict[str, Series], strategy: Strategy, params: dict, *, sta
     trades: List[Dict[str, Any]] = []
     equity: List[Tuple[date, float]] = []
     in_stocks: List[float] = []
+    cash_min = capital
 
     def value(d: date) -> float:
         return cash + sum(q * (_last_close(series[t], d) or 0.0) for t, q in qty.items())
@@ -211,12 +215,14 @@ def simulate(series: Dict[str, Series], strategy: Strategy, params: dict, *, sta
                         sell(t, px, d, q)
             cash -= due
             st["taxes"] += due
+        cash_min = min(cash_min, cash)
         prev_year = d.year
         prev_d = d
         # 4. заявки, выставленные вчера
         if pending_target is not None:
             execute(pending_target, d, "open" if fill == "open" else "close")
             pending_target = None
+            cash_min = min(cash_min, cash)
         # 5. оценка на закрытии
         eq = value(d)
         equity.append((d, eq))
@@ -246,7 +252,8 @@ def simulate(series: Dict[str, Series], strategy: Strategy, params: dict, *, sta
         st["taxes"] += due
     equity[-1] = (last, cash)
     return {"equity": equity, "trades": trades, "final": cash, "costs": st["costs"], "taxes": st["taxes"],
-            "dividends": st["dividends"], "capital": capital, "start": cal[0], "end": last, "in_stocks": in_stocks}
+            "dividends": st["dividends"], "capital": capital, "start": cal[0], "end": last, "in_stocks": in_stocks,
+            "cash_min": cash_min}
 
 
 def daily_returns(equity: Sequence[Tuple[date, float]]) -> List[float]:
