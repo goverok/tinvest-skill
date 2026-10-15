@@ -69,6 +69,17 @@ class View:
             raise IndexError(f"{t}: нет бара со смещением {offset} на {self.today}")
         return self._s[t][field][i]
 
+    def bars_until(self, d: date) -> int:
+        """Сколько баров календаря IMOEX строго после today и не позже d. Биржевой календарь известен заранее —
+        единственное, что View знает о будущем."""
+        cal = self._s["IMOEX"]["dates"]
+        return bisect.bisect_right(cal, d) - bisect.bisect_right(cal, self.today)
+
+    def upcoming_dividends(self, t: str) -> List[Dict[str, Any]]:
+        """Дивиденды с ex-датой после today, уже объявленные к today (declared <= today; без поля declared — известны)."""
+        return [dv for dv in self._s[t].get("divs", []) if dv["ex"] > self.today
+                and (dv.get("declared") is None or dv["declared"] <= self.today)]
+
 
 Strategy = Callable[[View, dict, dict], Dict[str, float]]
 

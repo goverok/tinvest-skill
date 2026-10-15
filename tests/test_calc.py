@@ -246,6 +246,12 @@ def test_bt_data():
             "recordDate": "2020-01-03T00:00:00Z", "paymentDate": "2020-01-10T00:00:00Z"}]
     s = make_series("X", _candles(date(2020, 1, 1), [110.0, 100.0, 100.0]), dividends=old)
     assert s["divs"][0]["ex"] == date(2020, 1, 2) and close(s["tr"][1], 1.0) and close(s["tr"][2], 1.0), (s["divs"], s["tr"])
+    # дата объявления: declaredDate из API; отсутствует или позже lastBuyDate -> lastBuyDate − 7 дней
+    assert s["divs"][0]["declared"] == date(2019, 12, 26), s["divs"]
+    s = make_series("X", _candles(date(2020, 1, 1), [110.0, 100.0, 100.0]), dividends=[dict(old[0], declaredDate="2019-12-01T00:00:00Z")])
+    assert s["divs"][0]["declared"] == date(2019, 12, 1)
+    s = make_series("X", _candles(date(2020, 1, 1), [110.0, 100.0, 100.0]), dividends=[dict(old[0], declaredDate="2020-01-03T00:00:00Z")])
+    assert s["divs"][0]["declared"] == date(2019, 12, 26)
     # качество: разрыв > 7 дней, нулевой объём, скачок > 30% без сплита
     c = _candles(date(2024, 1, 1), [10.0, 10.0, 14.0])
     c[2]["time"] = "2024-01-20T00:00:00Z"
@@ -485,7 +491,7 @@ def test_bt_sim():
 
 def test_bt_strategies():
     from bt_sim import View
-    from bt_strategies import FAMILIES, donchian, equal_weight, grid_variants, momentum, random_portfolio, trend_vol
+    from bt_strategies import FAMILIES, div_runup, donchian, equal_weight, grid_variants, momentum, random_portfolio, trend_vol
     d0 = date(2020, 1, 1)
     n = 300
     up = _series("UP", d0, [10 + i * 0.1 for i in range(n)])          # ровный рост
@@ -497,6 +503,24 @@ def test_bt_strategies():
     series = {"IMOEX": idx, "UP": up, "FL": flat, "DN": down, "UR": up_rev}
     today = up["dates"][-1]
     v = View(series, today, ["UP", "FL", "DN", "UR"])
+
+    # div_runup: дивиденд с ex на баре 50; L=5 -> вход при 7 барах до ex (сигнал), выход при 2; объявление и доходность фильтруют
+    ex = up["dates"][50]
+    dv_a = {"ex": ex, "pay": ex, "amount": 0.5, "declared": up["dates"][30]}
+    a = _series("A", d0, [10.0] * n, divs=[dv_a])
+    b = _series("B", d0, [10.0] * n, divs=[dict(dv_a, amount=1.0)])
+    c = _series("C", d0, [10.0] * n, divs=[dict(dv_a, declared=up["dates"][46])])
+    ser = {"IMOEX": idx, "A": a, "B": b, "C": c}
+    prm = {"L": 5, "K": 2, "min_yield": 0.0}
+    v43, v44, v47, v48 = (View(ser, up["dates"][i], ["A", "B", "C"]) for i in (43, 44, 47, 48))
+    assert v43.bars_until(ex) == 7 and v48.bars_until(ex) == 2
+    assert div_runup(v42 := View(ser, up["dates"][42], ["A", "B", "C"]), prm, {}) == {} and v42.bars_until(ex) == 8
+    w = div_runup(v43, prm, {})
+    assert set(w) == {"A", "B"} and close(w["A"], 0.5), w                      # C ещё не объявлен (declared = бар 46)
+    assert set(div_runup(v47, prm, {})) == {"B", "C"}, div_runup(v47, prm, {})  # C объявлен; K=2: B (10%), затем тикер при равных 5%
+    assert div_runup(v48, prm, {}) == {}                                        # n=2: выход (продажа на open cum-дня)
+    assert set(div_runup(v44, {"L": 5, "K": 5, "min_yield": 0.08}, {})) == {"B"}
+    assert "div_runup" in FAMILIES and len(grid_variants(FAMILIES["div_runup"]["grid"])) == 18
 
     w = momentum(v, {"L": 6, "K": 2, "market_filter": 0}, {})
     assert set(w) == {"UP", "UR"} and close(sum(w.values()), 1.0), w

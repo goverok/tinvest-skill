@@ -108,6 +108,26 @@ def trend_vol(view: View, p: dict, state: dict) -> Dict[str, float]:
     return {t: w * scale for t, w in raw.items()}
 
 
+def div_runup(view: View, p: dict, state: dict) -> Dict[str, float]:
+    """Разгон перед отсечкой: держим бумагу L баров до последнего дня с дивидендом и выходим на его открытии
+    (заявка с закрытия предыдущего бара), дивиденд не получаем — налога на него нет. Сигнал только по уже объявленным
+    дивидендам с доходностью >= min_yield; до K позиций весом 1/K, при избытке — по дивдоходности.
+    До ex-даты n баров: вход при n = L + 2 (исполнится на open бара cum − L), выход при n = 2 (open cum-дня)."""
+    cands = []
+    for t in view.universe:
+        if not view.active(t):
+            continue
+        px = view.at(t, "close")
+        for dv in view.upcoming_dividends(t):
+            n = view.bars_until(dv["ex"])
+            y = dv["amount"] / px if px > 0 else 0.0
+            if 3 <= n <= p["L"] + 2 and y >= p["min_yield"]:
+                cands.append((y, t))
+                break
+    top = [t for _, t in sorted(cands, reverse=True)[:p["K"]]]
+    return {t: 1.0 / p["K"] for t in top}
+
+
 def random_portfolio(view: View, p: dict, state: dict) -> Dict[str, float]:
     """K случайных бумаг равными весами; генератор — от seed и даты, чтобы прогон был воспроизводим."""
     avail = [t for t in view.universe if view.active(t)]
@@ -140,6 +160,7 @@ FAMILIES = {
     "momentum": {"fn": momentum, "grid": {"L": [3, 6, 12], "K": [3, 5, 8], "market_filter": [0, 1]}, "rebalance": "monthly"},
     "donchian": {"fn": donchian, "grid": {"N": [20, 55, 100], "M": [10, 20], "K": [5, 10]}, "rebalance": "daily"},
     "trend_vol": {"fn": trend_vol, "grid": {"N": [50, 100, 200], "target_vol": [0.10, 0.15, 0.20]}, "rebalance": "daily"},
+    "div_runup": {"fn": div_runup, "grid": {"L": [5, 10, 15], "K": [3, 5, 10], "min_yield": [0.0, 0.02]}, "rebalance": "daily"},
 }
 BENCHMARKS = {
     "LQDT": (hold_safe, {}, "monthly"),

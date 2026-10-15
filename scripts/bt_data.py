@@ -45,6 +45,9 @@ HISTORY_FROM = date(2013, 1, 1)  # год прогрева перед TRAIN
 # последний день покупки был на день раньше, т.е. реальная ex-дата (первый бар без дивиденда) = бар на lastBuyDate.
 # Проверено по гэпам: до перехода 240 из 253 событий ≥ 2% гэпуют на баре lastBuyDate, после — 85 из 87 на следующем.
 T1_SETTLEMENT_FROM = date(2023, 7, 31)
+# Дата, с которой дивиденд считается известным стратегии: declaredDate из API; если её нет или она позже lastBuyDate
+# (ошибка данных, 68 из 570), берём lastBuyDate − DECLARED_FALLBACK_DAYS — короче типичного срока между собранием и отсечкой.
+DECLARED_FALLBACK_DAYS = 7
 PAUSE_2022 = (date(2022, 2, 25), date(2022, 3, 31))
 # окрестность обвала и паузы 2022: скачки здесь — рынок, а не неучтённый сплит
 CRASH_2022 = (date(2022, 2, 21), date(2022, 4, 8))
@@ -93,7 +96,10 @@ def make_series(ticker: str, candles: Sequence[Dict[str, Any]], lot: int = 1,
         if i >= len(s["dates"]):
             continue  # отсечка позже последней свечи — в истории не участвует
         ex = s["dates"][i]
-        s["divs"].append({"ex": ex, "pay": pay, "amount": amount / _split_factor(ex, splits)})
+        declared = parse_date(dv.get("declaredDate"))
+        if not declared or declared > last_buy:
+            declared = last_buy - timedelta(days=DECLARED_FALLBACK_DAYS)
+        s["divs"].append({"ex": ex, "pay": pay, "amount": amount / _split_factor(ex, splits), "declared": declared})
     s["divs"].sort(key=lambda x: x["ex"])
     div_on_ex = {}
     for dv in s["divs"]:
