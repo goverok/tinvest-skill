@@ -185,6 +185,35 @@ def test_backtest():
     print("backtest ok")
 
 
+def test_sharpe():
+    from finmath import deflated_sharpe, moments, norm_cdf, norm_ppf, sharpe
+    # постоянная доходность 0.1% в день при rf 0 -> std 0 -> None
+    assert sharpe([0.001] * 10) is None
+    # чередование +1%/-1% со средним 0 -> Sharpe 0; +2%/0% -> mean 1%, std ~1% -> ~sqrt(252)
+    assert close(sharpe([0.01, -0.01] * 50), 0.0, 1e-9)
+    s = sharpe([0.02, 0.0] * 50)
+    assert s is not None and 15.0 < s < 16.0, s
+    # rf вычитается: доходности 2%/0% при rf 1% -> избыточные +1%/-1% -> 0
+    assert close(sharpe([0.02, 0.0] * 5, [0.01] * 10), 0.0, 1e-9)
+    # доходность равна rf -> избыточная нулевая дисперсия -> None
+    assert sharpe([0.01] * 5, [0.01] * 5) is None
+    m, sd, sk, ku = moments([1.0, 2.0, 3.0, 4.0, 5.0])
+    assert close(m, 3.0) and close(sd, 2.5 ** 0.5) and close(sk, 0.0) and 1.5 < ku < 2.0, (m, sd, sk, ku)
+    assert close(norm_cdf(0.0), 0.5) and close(norm_cdf(1.96), 0.975, 1e-3)
+    assert close(norm_ppf(0.975), 1.96, 1e-2) and close(norm_ppf(0.5), 0.0, 1e-6)
+    # одна попытка -> порог 0, PSR обычный: sr=0.1/день, T=1000 -> p ~ 0.001
+    sr_star, p1 = deflated_sharpe(0.1, 1, 1000)
+    assert sr_star == 0.0 and p1 < 0.002, (sr_star, p1)
+    # больше попыток -> порог выше, p больше
+    s39, p39 = deflated_sharpe(0.1, 39, 1000)
+    assert s39 > 0.0 and p39 > p1, (s39, p39)
+    s100, p100 = deflated_sharpe(0.1, 100, 1000)
+    assert s100 > s39 and p100 > p39
+    # нулевой Sharpe при 39 попытках -> p > 0.5
+    assert deflated_sharpe(0.0, 39, 1000)[1] > 0.5
+    print("sharpe ok")
+
+
 if __name__ == "__main__":
     test_xirr()
     test_ytm_duration()
@@ -192,4 +221,5 @@ if __name__ == "__main__":
     test_allocate()
     test_reports()
     test_backtest()
+    test_sharpe()
     print("ALL OK")

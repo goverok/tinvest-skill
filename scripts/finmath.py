@@ -2,6 +2,7 @@
 
 Все функции детерминированы и покрыты tests/test_calc.py.
 """
+import math
 from datetime import date
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -165,3 +166,66 @@ def allocate(amount: float, current: Dict[str, float], targets: Dict[str, float]
         for k in targets:
             alloc[k] += rest * targets[k] / w
     return alloc
+
+
+# ---------- Sharpe и поправка на перебор ----------
+
+def moments(x: Sequence[float]) -> Tuple[float, float, float, float]:
+    """(среднее, выборочное ст. отклонение, асимметрия, эксцесс; у нормального эксцесс 3)."""
+    n = len(x)
+    if n < 2:
+        return (x[0] if x else 0.0), 0.0, 0.0, 3.0
+    m = sum(x) / n
+    d2 = sum((v - m) ** 2 for v in x)
+    sd = math.sqrt(d2 / (n - 1))
+    if d2 == 0:
+        return m, 0.0, 0.0, 3.0
+    pop_sd = math.sqrt(d2 / n)
+    skew = sum((v - m) ** 3 for v in x) / n / pop_sd ** 3
+    kurt = sum((v - m) ** 4 for v in x) / n / pop_sd ** 4
+    return m, sd, skew, kurt
+
+
+def sharpe(returns: Sequence[float], rf: Optional[Sequence[float]] = None, periods: int = 252) -> Optional[float]:
+    """Годовой Sharpe: mean(r - rf) / std(r - rf) * sqrt(periods). None при < 2 наблюдениях или нулевой дисперсии."""
+    ex = [r - (rf[i] if rf else 0.0) for i, r in enumerate(returns)]
+    if len(ex) < 2:
+        return None
+    m, sd, _, _ = moments(ex)
+    if sd == 0:
+        return None
+    return m / sd * math.sqrt(periods)
+
+
+def norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def norm_ppf(p: float) -> float:
+    """Квантиль стандартного нормального распределения бисекцией."""
+    lo, hi = -40.0, 40.0
+    for _ in range(200):
+        mid = (lo + hi) / 2
+        if norm_cdf(mid) < p:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
+
+
+EULER_GAMMA = 0.5772156649015329
+
+
+def deflated_sharpe(sr: float, n_trials: int, n_obs: int, skew: float = 0.0, kurt: float = 3.0) -> Tuple[float, float]:
+    """Deflated Sharpe Ratio (Bailey & López de Prado, 2014). sr — за период (не годовой).
+    Возвращает (sr_star, p_value): ожидаемый максимум Sharpe среди n_trials попыток с нулевым истинным Sharpe
+    и вероятность того, что истинный Sharpe стратегии не превышает этот порог."""
+    if n_trials <= 1:
+        sr_star = 0.0
+    else:
+        var_sr = 1.0 / n_obs  # дисперсия оценки Sharpe при нулевом истинном значении
+        sr_star = math.sqrt(var_sr) * ((1 - EULER_GAMMA) * norm_ppf(1 - 1.0 / n_trials)
+                                       + EULER_GAMMA * norm_ppf(1 - 1.0 / (n_trials * math.e)))
+    denom = math.sqrt(max(1e-12, 1 - skew * sr + (kurt - 1) / 4.0 * sr * sr))
+    z = (sr - sr_star) * math.sqrt(n_obs - 1) / denom
+    return sr_star, 1.0 - norm_cdf(z)
