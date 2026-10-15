@@ -12,7 +12,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from common import data_dir, money, parse_date, read_json, today, warn, write_json  # noqa: E402
+from common import currency_of, data_dir, money, parse_date, read_json, today, warn, write_json  # noqa: E402
 
 Series = Dict[str, Any]
 
@@ -72,6 +72,10 @@ def make_series(ticker: str, candles: Sequence[Dict[str, Any]], lot: int = 1,
         amount = money(dv.get("dividendNet"))
         if amount <= 0:
             continue
+        cur = currency_of(dv.get("dividendNet"))
+        if cur != "rub":
+            s["warnings"].append(f"{ticker}: дивиденд {str(dv.get('lastBuyDate') or dv.get('recordDate'))[:10]} в {cur} пропущен (нет курса)")
+            continue
         last_buy = parse_date(dv.get("lastBuyDate")) or parse_date(dv.get("recordDate"))
         pay = parse_date(dv.get("paymentDate")) or last_buy
         if not last_buy or not s["dates"]:
@@ -117,7 +121,8 @@ def synthetic_safe(dates: Sequence[date], key_rate: Sequence[Tuple[date, float]]
     out, v = [], 1.0
     for i, d in enumerate(dates):
         if i:
-            rate = max((r for sd, r in key_rate if sd <= d), default=key_rate[0][1]) - spread
+            j = bisect.bisect_right([sd for sd, _ in key_rate], d) - 1  # последняя запись, вступившая в силу
+            rate = key_rate[max(j, 0)][1] - spread
             v *= 1.0 + rate * (d - dates[i - 1]).days / 365.0
         out.append(v)
     return out
@@ -125,7 +130,9 @@ def synthetic_safe(dates: Sequence[date], key_rate: Sequence[Tuple[date, float]]
 
 def splice_safe(calendar_dates: Sequence[date], real: Optional[Series],
                 key_rate: Sequence[Tuple[date, float]] = KEY_RATE) -> Series:
-    """LQDT на весь календарь: до первой реальной свечи — синтетика, дальше реальные close в непрерывном масштабе."""
+    """LQDT на весь календарь: до первой реальной свечи — синтетика, дальше реальные close в непрерывном масштабе.
+    Даты результата — объединение дат календаря (синтетика) и дат реального LQDT (могут быть выходные сессии),
+    поэтому потребитель обязан искать значения по дате (as-of), а не по позиции."""
     first_real = real["dates"][0] if real and real["dates"] else None
     syn_dates = [d for d in calendar_dates if first_real is None or d < first_real]
     syn = synthetic_safe(syn_dates, key_rate)
@@ -179,8 +186,10 @@ def _fetch_one(api, ticker: str, cached: Optional[Dict[str, Any]]) -> Dict[str, 
         # кэш (например, от backtest.py) начинается позже доступной истории — добираем голову
         head_to = parse_date(candles[0]["time"]) - timedelta(days=1)
         candles = api.get_day_candles(inst["uid"], max(HISTORY_FROM, parse_date(inst["first1dayCandleDate"])), head_to) + candles
-    start = (parse_date(candles[-1]["time"]) + timedelta(days=1)) if candles else HISTORY_FROM
+    start = parse_date(candles[-1]["time"]) if candles else HISTORY_FROM
     if start <= today():
+        # последняя закэшированная свеча могла быть неполной (внутридневной) — заменяем свежей
+        candles = [c for c in candles if parse_date(c["time"]) < start]
         candles += api.get_day_candles(inst["uid"], start, today())
     return {"instrument": inst, "candles": candles}
 
@@ -194,30 +203,39 @@ def load_universe(refresh: bool = False, tickers: Optional[Iterable[str]] = None
     splits = dict(SPLITS, **{k: [tuple(x) for x in v] for k, v in splits_file.items()})
     divs_all: Dict[str, List[Dict[str, Any]]] = read_json(bdir / "dividends.json", {}) or {}
     api = None
+    no_api = False
     raw: Dict[str, Dict[str, Any]] = {}
     for t in wanted:
         cached = read_json(_cache_path(t))
         last = parse_date(cached["candles"][-1]["time"]) if cached and cached.get("candles") else None
         stale = refresh or last is None or last < today() - timedelta(days=4) or _head_gap(cached)
         if stale:
+            if api is None and not no_api:
+                from tinvest_api import TInvestError, client_from_env
+                try:
+                    api = client_from_env()
+                except (ValueError, TInvestError) as e:
+                    no_api = True
+                    warn(f"нет доступа к API ({e}) — используется только кэш")
             if api is None:
-                from tinvest_api import client_from_env
-                api = client_from_env()
-            try:
-                data = _fetch_one(api, t, None if refresh else cached)
-                write_json(_cache_path(t), data)
-                cached = data
-            except Exception as e:  # noqa: BLE001 — один тикер не должен ронять выгрузку
-                warn(f"{t}: {e}")
                 if not cached:
-                    continue
+                    continue  # нет токена и нет кэша — тикер недоступен
+            else:
+                try:
+                    data = _fetch_one(api, t, None if refresh else cached)
+                    write_json(_cache_path(t), data)
+                    cached = data
+                except Exception as e:  # noqa: BLE001 — один тикер не должен ронять выгрузку
+                    warn(f"{t}: {e}")
+                    if not cached:
+                        continue
         if t not in ("IMOEX", "LQDT") and (refresh or t not in divs_all) and api is not None:
             inst = cached["instrument"]
             try:
                 divs_all[t] = api.get_dividends(inst["uid"], inst.get("figi"), HISTORY_FROM, today() + timedelta(days=90))
             except Exception as e:  # noqa: BLE001
                 warn(f"{t}: дивиденды не получены: {e}")
-                divs_all.setdefault(t, [])
+                # ключ не пишем — тикер будет перекачан в следующий раз, предупреждение сработает ниже
         raw[t] = cached
     if api is not None:
         write_json(bdir / "dividends.json", divs_all)

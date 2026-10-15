@@ -262,6 +262,22 @@ def test_bt_data():
     assert sp["dates"] == cal and len(sp["close"]) == 5
     assert close(sp["close"][3] / sp["close"][2], 1.01) and sp["close"][1] <= sp["close"][2]
     assert sp["tr"] == sp["close"] or close(sp["tr"][-1] / sp["tr"][0], sp["close"][-1] / sp["close"][0])
+    # ставка берётся из ПОСЛЕДНЕЙ вступившей в силу записи, а не максимальной
+    from datetime import timedelta
+    d2019 = [date(2019, 1, 1) + timedelta(days=i) for i in range(365)]
+    v = synthetic_safe(d2019, [(date(2018, 1, 1), 0.10), (date(2019, 7, 1), 0.06)])
+    exp, hi, lo = 1.0, 1.0, 1.0
+    for i in range(1, len(d2019)):
+        r = (0.095 if d2019[i] < date(2019, 7, 1) else 0.055)
+        exp *= 1 + r * 1 / 365
+        hi *= 1 + 0.095 / 365
+        lo *= 1 + 0.055 / 365
+    assert close(v[-1], exp) and lo < v[-1] < hi, (v[-1], exp, lo, hi)
+    # дивиденд в валюте (не RUB) пропускается с предупреждением и не влияет на tr
+    usd = [{"dividendNet": {"units": "1", "nano": 0, "currency": "usd"}, "lastBuyDate": "2024-01-02T00:00:00Z",
+            "paymentDate": "2024-01-10T00:00:00Z"}]
+    s = make_series("U", _candles(date(2024, 1, 1), [100.0, 110.0, 120.0]), dividends=usd)
+    assert s["divs"] == [] and close(s["tr"][2], 1.2) and any("usd" in x for x in s["warnings"]), s["warnings"]
     print("bt_data ok")
 
 
