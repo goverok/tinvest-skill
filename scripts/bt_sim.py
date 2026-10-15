@@ -51,6 +51,11 @@ class View:
     def has(self, t: str, k: int) -> bool:
         return self.n(t) >= k
 
+    def active(self, t: str, max_gap_days: int = 7) -> bool:
+        """Бумага торгуется: есть хотя бы один бар, и последний бар не старше max_gap_days от today."""
+        e = self._e(t) if t in self._s else 0
+        return e > 0 and (self.today - self._s[t]["dates"][e - 1]).days <= max_gap_days
+
     def last(self, t: str, field: str, k: int) -> List[float]:
         e = self._e(t)
         return self._s[t][field][max(0, e - k):e]

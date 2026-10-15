@@ -31,7 +31,7 @@ def momentum(view: View, p: dict, state: dict) -> Dict[str, float]:
     need = p["L"] * BARS_PER_MONTH + 1
     scores = []
     for t in view.universe:
-        if not view.has(t, need):
+        if not view.active(t) or not view.has(t, need):
             continue
         tr = view.last(t, "tr", need)
         scores.append((tr[-1 - BARS_PER_MONTH] / tr[0] - 1, t))
@@ -50,6 +50,9 @@ def donchian(view: View, p: dict, state: dict) -> Dict[str, float]:
     held: Dict[str, bool] = state.setdefault("held", {})
     n, m, k = p["N"], p["M"], p["K"]
     for t in list(held):  # выходы
+        if not view.active(t):  # бумага перестала торговаться — освобождаем слот
+            del held[t]
+            continue
         if not view.has(t, m + 1):
             continue
         lows = view.last(t, "low", m + 1)[:-1]
@@ -57,7 +60,7 @@ def donchian(view: View, p: dict, state: dict) -> Dict[str, float]:
             del held[t]
     candidates = []
     for t in view.universe:
-        if t in held or not view.has(t, n + 1):
+        if t in held or not view.active(t) or not view.has(t, n + 1):
             continue
         highs = view.last(t, "high", n + 1)[:-1]
         c = view.at(t, "close")
@@ -76,7 +79,7 @@ def trend_vol(view: View, p: dict, state: dict) -> Dict[str, float]:
     n, target = p["N"], p["target_vol"]
     inv = {}
     for t in view.universe:
-        if not view.has(t, max(n, 22)):
+        if not view.active(t) or not view.has(t, max(n, 22)):
             continue
         closes = view.last(t, "close", n)
         if closes[-1] <= sum(closes) / n:
@@ -97,7 +100,7 @@ def trend_vol(view: View, p: dict, state: dict) -> Dict[str, float]:
 
 def random_portfolio(view: View, p: dict, state: dict) -> Dict[str, float]:
     """K случайных бумаг равными весами; генератор — от seed и даты, чтобы прогон был воспроизводим."""
-    avail = [t for t in view.universe if view.has(t, 1)]
+    avail = [t for t in view.universe if view.active(t)]
     k = min(p["K"], len(avail))
     if k == 0:
         return {}
@@ -106,7 +109,7 @@ def random_portfolio(view: View, p: dict, state: dict) -> Dict[str, float]:
 
 
 def equal_weight(view: View, p: dict, state: dict) -> Dict[str, float]:
-    avail = [t for t in view.universe if view.has(t, 1)]
+    avail = [t for t in view.universe if view.active(t)]
     return {t: 1.0 / len(avail) for t in avail} if avail else {}
 
 

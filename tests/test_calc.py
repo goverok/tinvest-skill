@@ -444,6 +444,13 @@ def test_bt_sim():
     s = summarize(r, safe_series=safe)
     assert close(s["final"], 1100.0) and s["xirr"] is not None and s["mdd"] <= 0 and s["n_obs"] == 6 and s["trades"] >= 2
     assert 2024 in s["yearly"] and 0 < s["in_market"] <= 1
+    # View.active: бумага, не торгующаяся дольше 7 дней, неактивна
+    from bt_sim import View
+    old = _flat("OLD", date(2024, 1, 1), 10)          # последний бар 2024-01-10
+    v_act = View({"OLD": old}, date(2024, 1, 20), ["OLD"])
+    assert not v_act.active("OLD") and not v_act.active("NOPE")
+    assert View({"OLD": old}, date(2024, 1, 11), ["OLD"]).active("OLD")
+    assert not View({"OLD": old}, date(2023, 12, 31), ["OLD"]).active("OLD")   # баров ещё нет
     print("bt_sim ok")
 
 
@@ -470,6 +477,15 @@ def test_bt_strategies():
     # мало истории -> пусто
     assert momentum(View(series, up["dates"][30], ["UP"]), {"L": 6, "K": 1, "market_filter": 0}, {}) == {}
 
+    # momentum пропускает последний месяц: у UR 3-мес. доходность «без пропуска» отрицательна, «с пропуском» положительна
+    ur2 = _series("UR2", d0, [10 + i * 0.1 for i in range(79)] + [17.9 - j * 0.5 for j in range(21)])
+    fl2 = _series("FL2", d0, [10.0] * 100)
+    v2 = View({"IMOEX": idx, "UR2": ur2, "FL2": fl2}, ur2["dates"][-1], ["UR2", "FL2"])
+    trs = v2.last("UR2", "tr", 64)
+    skip_score, plain_score = trs[-22] / trs[0] - 1, trs[-1] / trs[0] - 1
+    assert skip_score > 0 > plain_score, (skip_score, plain_score)   # без пропуска выбрали бы FL2 (0 > отрицательного)
+    assert set(momentum(v2, {"L": 3, "K": 1, "market_filter": 0}, {})) == {"UR2"}
+
     # Donchian: UP на новом максимуме -> вход; FL (не выше max 20) -> нет; удержание через state, выход при пробое вниз
     st = {}
     w = donchian(v, {"N": 20, "M": 10, "K": 5}, st)
@@ -485,6 +501,17 @@ def test_bt_strategies():
     assert "PK" in st.get("held", {})
     w3 = donchian(View(sp, peak["dates"][-1], ["PK"]), {"N": 20, "M": 10, "K": 5}, st)  # пробой вниз
     assert "PK" not in w3
+
+    # бумага перестала торговаться: слот Donchian освобождается, equal_weight её не берёт
+    dead = _series("DD", d0, [10 + i * 0.1 for i in range(n - 10)])        # последний бар за 10 дней до today
+    vd = View({"IMOEX": idx, "DD": dead, "UP": up}, today, ["DD", "UP"])
+    st = {"held": {"DD": True}}
+    wd = donchian(vd, {"N": 20, "M": 10, "K": 5}, st)
+    assert "DD" not in wd and "DD" not in st["held"], (wd, st)
+    assert equal_weight(vd, {}, {}) == {"UP": 1.0}
+    assert "DD" not in momentum(vd, {"L": 3, "K": 2, "market_filter": 0}, {})
+    assert "DD" not in trend_vol(vd, {"N": 50, "target_vol": 0.15}, {})
+    assert "DD" not in random_portfolio(vd, {"K": 2, "seed": 1}, {})
 
     # trend_vol: обе выше SMA50; менее волатильная получает больший вес; сумма <= 1
     noisy = _series("NZ", d0, [10 + i * 0.1 + (1.5 if i % 2 else -1.5) for i in range(n)])
