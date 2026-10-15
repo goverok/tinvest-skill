@@ -558,6 +558,8 @@ def test_bt_protocol():
     assert not ok and any("случайн" in w for w in why)
     ok, why = bp.validate(tr, {"xirr": 0.20, "sharpe": 1.0, "mdd": -0.35}, {"xirr": 0.10}, [0.1])
     assert not ok and any("просадка" in w for w in why)
+    ok, why = bp.validate(tr, {"xirr": None, "sharpe": 1.0, "mdd": -0.25}, {"xirr": 0.10}, [0.1])
+    assert not ok and why
 
     assert bp.years_beating({2020: 0.1, 2021: 0.2, 2022: -0.1}, {2020: 0.05, 2021: 0.3, 2022: 0.05}) == (1, 3)
     assert close(bp.top2_share({2020: 0.1, 2021: 0.3, 2022: 0.1, 2023: 0.5}), 0.8)
@@ -566,6 +568,12 @@ def test_bt_protocol():
     assert fam == "momentum" and params == {"L": 12, "K": 5, "market_filter": 1}
     fam, params = bp.parse_finalist("trend_vol:N=100,target_vol=0.15")
     assert params == {"N": 100, "target_vol": 0.15}
+    for bad in ("momentum:L=7,K=5,market_filter=1", "momentum:L=12,K=5.9,market_filter=1"):
+        try:
+            bp.parse_finalist(bad)
+            assert False, bad
+        except ValueError:
+            pass
 
     # журнал закрытого окна во временной папке
     os.environ["TINVEST_HOME"] = tempfile.mkdtemp(prefix="tinvest-holdout-")
@@ -601,6 +609,30 @@ def test_bt_protocol():
     assert b["xirr"] is not None and b["in_market"] > 0.9
     thr = bp.threshold_rate(series, "trend_vol", {"N": 50, "target_vol": 0.15}, win, universe=["A", "B"])
     assert thr is None or 0.0 < thr < 0.5
+    assert thr is None   # на этой фикстуре нет смены знака между 0.02 и 0.40 — ветка «не нашли»
+    # скобка есть: стратегия держит только A с постоянным дневным ростом; эталон — независимая бисекция по synthetic_safe
+    from bt_data import synthetic_safe
+    series2 = dict(series)
+    series2["A"] = _series("A", d0, [10 * 1.0006 ** i for i in range(n)])
+    bp.FAMILIES["_hold_a"] = {"fn": lambda v, p, s: {"A": 1.0} if v.has("A", 1) else {}, "grid": {"x": [1]},
+                              "rebalance": "monthly"}
+    try:
+        win2 = (d0, series2["A"]["dates"][-1])
+        x_strat = bp.run_variant(series2, "_hold_a", {"x": 1}, win2, universe=["A"])["xirr"]
+        cal = series2["IMOEX"]["dates"]
+        days = (cal[-1] - cal[0]).days
+        lo_r, hi_r = 0.0, 0.6
+        for _ in range(50):
+            mid = (lo_r + hi_r) / 2
+            syn = synthetic_safe(cal, [(date(1900, 1, 1), mid)], spread=0.0)
+            if (syn[-1] / syn[0]) ** (365.0 / days) - 1.0 < x_strat:
+                lo_r = mid
+            else:
+                hi_r = mid
+        thr2 = bp.threshold_rate(series2, "_hold_a", {"x": 1}, win2, universe=["A"])
+        assert thr2 is not None and abs(thr2 - lo_r) < 0.005, (thr2, lo_r)
+    finally:
+        del bp.FAMILIES["_hold_a"]
     print("bt_protocol ok")
 
 

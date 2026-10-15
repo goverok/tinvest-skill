@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bt_data import OLDEST10, Series, synthetic_safe  # noqa: E402
 from bt_sim import COST, SLIP, TAX, simulate, summarize  # noqa: E402
 from bt_strategies import BENCHMARKS, FAMILIES, grid_variants, random_portfolio  # noqa: E402
-from common import home, read_json, today, write_json  # noqa: E402
+from common import fmt_pct, home, read_json, today, write_json  # noqa: E402
 from finmath import deflated_sharpe  # noqa: E402
 
 Window = Tuple[date, Optional[date]]
@@ -98,7 +98,7 @@ def percentile(values: Sequence[float], x: float) -> float:
 def validate(train: dict, valid: dict, lqdt_valid: dict, rand_valid: Sequence[float]) -> Tuple[bool, List[str]]:
     why = []
     if (valid["xirr"] or -1) <= (lqdt_valid["xirr"] or -1):
-        why.append(f"XIRR {valid['xirr']:.1%} не выше LQDT {lqdt_valid['xirr']:.1%}")
+        why.append(f"XIRR {fmt_pct(valid['xirr'])} не выше LQDT {fmt_pct(lqdt_valid['xirr'])}")
     if percentile(rand_valid, valid["sharpe"] or 0.0) < RANDOM_PERCENTILE:
         why.append(f"Sharpe {valid['sharpe'] or 0:.2f} ниже {RANDOM_PERCENTILE:.0%}-го перцентиля случайных портфелей")
     if valid["mdd"] < train["mdd"] * MDD_TOLERANCE:
@@ -168,7 +168,10 @@ def verdict(hold_iis: dict, hold_brk: dict, lqdt_iis: dict, tmos_iis: dict, ew_i
 
 def threshold_rate(series: Dict[str, Series], family: str, params: dict, window: Window,
                    universe: Optional[Sequence[str]] = None, lo: float = 0.02, hi: float = 0.40) -> Optional[float]:
-    """Ставка безрискового актива, при которой XIRR стратегии равен ей: LQDT заменяется синтетикой с постоянной ставкой."""
+    """Ставка безрискового актива, при которой XIRR стратегии равен XIRR безрискового актива: LQDT заменяется
+    синтетикой с постоянной ставкой. Сравнение — по эффективной доходности (XIRR) безрискового пая за то же окно,
+    потому что ежедневное начисление даёт эффективную доходность выше номинальной; возвращается номинальная ставка
+    (её сравнивают с заявленной доходностью LQDT)."""
     cal = [d for d in series["IMOEX"]["dates"] if d <= _end(window)]
 
     def gap(rate: float) -> Optional[float]:
@@ -177,7 +180,14 @@ def threshold_rate(series: Dict[str, Series], family: str, params: dict, window:
         fake["LQDT"] = {"ticker": "LQDT", "lot": 1, "dates": cal, "open": syn, "high": syn, "low": syn, "close": syn,
                         "volume": [0.0] * len(syn), "tr": syn, "divs": [], "warnings": []}
         x = run_variant(fake, family, params, window, universe=universe)["xirr"]
-        return None if x is None else x - rate
+        if x is None:
+            return None
+        i0 = next((i for i, d in enumerate(cal) if d >= window[0]), None)
+        if i0 is None or len(cal) - 1 <= i0:
+            return None
+        days = (cal[-1] - cal[i0]).days
+        safe_x = (syn[-1] / syn[i0]) ** (365.0 / days) - 1.0
+        return x - safe_x
 
     g_lo, g_hi = gap(lo), gap(hi)
     if g_lo is None or g_hi is None or g_lo * g_hi > 0:
@@ -204,7 +214,10 @@ def parse_finalist(spec: str) -> Tuple[str, dict]:
         k, _, v = kv.partition("=")
         if k not in grid:
             raise ValueError(f"{fam}: нет параметра {k}; есть: {', '.join(grid)}")
-        params[k] = type(grid[k][0])(float(v)) if isinstance(grid[k][0], (int, float)) else v
+        val = type(grid[k][0])(float(v)) if isinstance(grid[k][0], (int, float)) else v
+        if val not in grid[k] or (isinstance(grid[k][0], (int, float)) and float(v) != val):
+            raise ValueError(f"{fam}: значение {k}={v} вне сетки {grid[k]}")
+        params[k] = val
     missing = [k for k in grid if k not in params]
     if missing:
         raise ValueError(f"{fam}: не заданы {', '.join(missing)}")
