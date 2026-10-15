@@ -281,6 +281,123 @@ def test_bt_data():
     print("bt_data ok")
 
 
+def _series(ticker, start, closes, opens=None, lot=1, divs=()):
+    from bt_data import make_series
+    s = make_series(ticker, _candles(start, closes, opens), lot=lot)
+    s["divs"] = list(divs)
+    return s
+
+
+def _flat(ticker, start, n, price=1.0, lot=1):
+    return _series(ticker, start, [price] * n, lot=lot)
+
+
+def _live(r):
+    """Сделки до ликвидации в последний день окна."""
+    return [t for t in r["trades"] if t["date"] < r["end"]]
+
+
+def test_bt_sim():
+    from bt_sim import View, simulate, summarize
+    d0 = date(2024, 1, 1)
+    idx = _flat("IMOEX", d0, 6)
+    safe = _flat("LQDT", d0, 6)
+    a = _series("A", d0, [10, 10, 12, 12, 12, 12], opens=[10, 10, 10, 12, 12, 12])
+    b = _flat("B", d0, 6, price=5.0, lot=10)
+    series = {"IMOEX": idx, "LQDT": safe, "A": a, "B": b}
+    kw = dict(start=d0, end=date(2024, 1, 6), capital=1000.0, cost=0.0, slip=0.0)
+
+    # View не видит будущего
+    v = View(series, date(2024, 1, 3), ["A", "B"])
+    assert v.n("A") == 3 and v.last("A", "close", 100) == [10, 10, 12] and v.at("A", "close") == 12 and v.at("A", "close", 1) == 10
+    try:
+        v.at("A", "close", 3)
+        assert False
+    except IndexError:
+        pass
+
+    # 50/50 с первого дня без издержек: A растёт 10 -> 12 на 3-й день (open 10 -> покупка по 10)
+    half = lambda view, p, st: {"A": 0.5, "B": 0.5}  # noqa: E731
+    r = simulate(series, half, {}, **kw)
+    # день 1: сигнал на закрытии, исполнение на open дня 2: 50 A @10, 10 лотов B = 100 шт @5 -> 500 + 500
+    # A: 50 * 12 = 600 с дня 3 -> итог 1100
+    assert close(r["final"], 1100.0), r["final"]
+    assert r["trades"][0]["date"] == date(2024, 1, 2) and {t["ticker"] for t in r["trades"][:2]} == {"A", "B"}
+    assert close(r["equity"][0][1], 1000.0) and close(r["equity"][-1][1], 1100.0)
+
+    # порог ребалансировки: цель 0.5/0.5, после роста A доля 600/1100 = 0.545 -> отклонение 4.5% > 2% -> сделка;
+    # с порогом 0.10 сделок после первых двух нет (ликвидационные в конце не считаем)
+    r2 = simulate(series, half, {}, rebalance_threshold=0.10, **kw)
+    assert len(_live(r2)) == 2, _live(r2)
+    r3 = simulate(series, half, {}, rebalance_threshold=0.02, **kw)
+    assert len(_live(r3)) > 2
+
+    # лоты: B лот 10 по 5 = 50 за лот; капитал 1000 и вес 0.07 = 70 -> 1 лот (50), не 1.4
+    r = simulate(series, lambda v, p, s: {"B": 0.07}, {}, **kw)
+    assert r["trades"][0]["qty"] == 10
+
+    # кэш не уходит в минус при издержках: вес 1.0 в A с комиссией 1% -> покупается 99 шт, кэш >= 0
+    r = simulate(series, lambda v, p, s: {"A": 1.0}, {}, start=d0, end=date(2024, 1, 6), capital=1000.0, cost=0.01, slip=0.0)
+    first_a = next(t for t in r["trades"] if t["ticker"] == "A")
+    assert first_a["qty"] == 99 and min(e for _, e in r["equity"]) > 0, first_a
+
+    # бумага без бара в этот день: C торгуется только 2 дня, оценка по последнему close, заявок по ней нет
+    c = _series("C", d0, [3.0, 3.0])
+    series_c = dict(series, C=c)
+    r = simulate(series_c, lambda v, p, s: {"C": 0.5}, {}, universe=["A", "B", "C"], **kw)
+    live = _live(r)
+    assert {t["ticker"] for t in live} == {"C", "LQDT"} and all(t["date"] == date(2024, 1, 2) for t in live), live
+    assert close(r["final"], 1000.0)  # C оценивается по последнему close 3.0 и так же ликвидируется
+
+    # дивиденд: ex день 3, выплата день 5, бумага продана на день 4 -> деньги всё равно приходят
+    a_div = _series("A", d0, [10] * 6, divs=[{"ex": date(2024, 1, 3), "pay": date(2024, 1, 5), "amount": 1.0}])
+    s2 = dict(series, A=a_div)
+    hold_then_sell = lambda v, p, st: {"A": 1.0} if v.today < date(2024, 1, 3) else {}  # noqa: E731
+    r = simulate(s2, hold_then_sell, {}, **kw)
+    assert close(r["dividends"], 100.0) and close(r["final"], 1100.0), (r["dividends"], r["final"])
+    # на брокерском счёте дивиденд минус 13%
+    r = simulate(s2, hold_then_sell, {}, tax_rate=0.13, **kw)
+    assert close(r["dividends"], 87.0), r["dividends"]
+
+    # налог по итогам года: прибыль 200 в 2024 -> 26 в первый день 2025
+    d1 = date(2024, 12, 30)
+    cal = [d1, date(2024, 12, 31), date(2025, 1, 3), date(2025, 1, 6)]
+    def _s(t, closes, lot=1):
+        from bt_data import make_series
+        return make_series(t, [{"time": d.isoformat() + "T00:00:00Z", "open": c, "close": c, "high": c, "low": c, "volume": 1}
+                               for d, c in zip(cal, closes)], lot=lot)
+    # сигнал на закрытии 30.12 -> покупка по open 31.12 (10); сигнал {} 31.12 -> продажа по open 03.01 (12)
+    s3 = {"IMOEX": _s("IMOEX", [1, 1, 1, 1]), "LQDT": _s("LQDT", [1, 1, 1, 1]), "A": _s("A", [10, 10, 12, 12])}
+    sig = lambda v, p, st: {"A": 1.0} if v.today == d1 else {}  # noqa: E731
+    r = simulate(s3, sig, {}, start=d1, end=cal[-1], capital=1000.0, cost=0.0, slip=0.0, tax_rate=0.13)
+    assert close(r["taxes"], 26.0) and close(r["final"], 1174.0), (r["taxes"], r["final"])
+
+    # fill: сигнал на закрытии дня 2 -> open дня 3 = 10, close дня 3 = 12
+    sig2 = lambda v, p, s: {"A": 1.0} if v.today == date(2024, 1, 2) else {}  # noqa: E731
+    ro = simulate(series, sig2, {}, fill="open", **kw)
+    rr = simulate(series, sig2, {}, fill="next_close", **kw)
+    # (пустая цель дня 1 -> остаток уходит в LQDT на дне 2, поэтому берём первую сделку именно по A)
+    fa = lambda res: next(t for t in res["trades"] if t["ticker"] == "A")  # noqa: E731
+    assert fa(ro)["price"] == 10 and fa(ro)["date"] == date(2024, 1, 3), fa(ro)
+    assert fa(rr)["price"] == 12 and fa(rr)["date"] == date(2024, 1, 3), fa(rr)
+
+    # monthly: стратегия вызывается только в последний торговый день месяца
+    calls = []
+    def spy(v, p, st):
+        calls.append(v.today)
+        return {}
+    big = {k: _flat(k, date(2024, 1, 29), 6) for k in ("IMOEX", "LQDT", "A")}
+    simulate(big, spy, {}, start=date(2024, 1, 29), end=date(2024, 2, 3), capital=1000.0, rebalance="monthly")
+    assert calls == [date(2024, 1, 31), date(2024, 2, 3)], calls  # конец января и последний день окна
+
+    # summarize
+    r = simulate(series, half, {}, **kw)
+    s = summarize(r, safe_series=safe)
+    assert close(s["final"], 1100.0) and s["xirr"] is not None and s["mdd"] <= 0 and s["n_obs"] == 6 and s["trades"] >= 2
+    assert 2024 in s["yearly"] and 0 < s["in_market"] <= 1
+    print("bt_sim ok")
+
+
 if __name__ == "__main__":
     test_xirr()
     test_ytm_duration()
@@ -290,4 +407,5 @@ if __name__ == "__main__":
     test_backtest()
     test_sharpe()
     test_bt_data()
+    test_bt_sim()
     print("ALL OK")
