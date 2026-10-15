@@ -219,6 +219,52 @@ def test_sharpe():
     print("sharpe ok")
 
 
+def _candles(start, closes, opens=None):
+    from datetime import timedelta
+    out = []
+    for i, c in enumerate(closes):
+        d = start + timedelta(days=i)
+        o = opens[i] if opens else c
+        out.append({"time": d.isoformat() + "T00:00:00Z", "open": o, "close": c, "high": max(o, c), "low": min(o, c), "volume": 100})
+    return out
+
+
+def test_bt_data():
+    from bt_data import check_quality, make_series, splice_safe, synthetic_safe
+    # сплит 1:10 на 4-й день: цены до него делятся на 10, объёмы умножаются
+    s = make_series("X", _candles(date(2024, 1, 1), [100.0, 110.0, 120.0, 12.0]), splits=[("2024-01-04", 10)])
+    assert s["close"] == [10.0, 11.0, 12.0, 12.0] and s["volume"][0] == 1000 and s["volume"][3] == 100, s["close"]
+    # дивиденд 10 на старую акцию: lastBuyDate 2024-01-02 -> ex 2024-01-03 (до сплита) -> 1.0 на новую;
+    # tr на ex = (12 + 1) / 11 от предыдущего
+    div = [{"dividendNet": {"units": "10", "nano": 0}, "lastBuyDate": "2024-01-02T00:00:00Z",
+            "recordDate": "2024-01-03T00:00:00Z", "paymentDate": "2024-01-10T00:00:00Z"}]
+    s = make_series("X", _candles(date(2024, 1, 1), [100.0, 110.0, 120.0, 12.0]), splits=[("2024-01-04", 10)], dividends=div)
+    assert len(s["divs"]) == 1 and s["divs"][0]["ex"] == date(2024, 1, 3) and close(s["divs"][0]["amount"], 1.0), s["divs"]
+    assert close(s["tr"][1], 1.1) and close(s["tr"][2], 1.1 * 13 / 11) and close(s["tr"][3], s["tr"][2])
+    # качество: разрыв > 7 дней, нулевой объём, скачок > 30% без сплита
+    c = _candles(date(2024, 1, 1), [10.0, 10.0, 14.0])
+    c[2]["time"] = "2024-01-20T00:00:00Z"
+    c[1]["volume"] = 0
+    w = check_quality(make_series("Y", c))
+    assert any("разрыв" in x for x in w) and any("объём" in x for x in w) and any("скачок" in x for x in w), w
+    # пауза 2022 не считается разрывом
+    c = _candles(date(2022, 2, 24), [10.0, 10.0])
+    c[1]["time"] = "2022-03-25T00:00:00Z"
+    assert not any("разрыв" in x for x in check_quality(make_series("Z", c)))
+    # синтетический LQDT: 10% годовых минус 0.5 п.п., ежедневная капитализация -> за 365 дней между 9.5% и 10%
+    days = [date(2019, 1, 1) + __import__("datetime").timedelta(days=i) for i in range(366)]
+    v = synthetic_safe(days, [(date(2018, 1, 1), 0.10)])
+    assert close(v[0], 1.0) and 1.095 < v[-1] < 1.10, v[-1]
+    # склейка: синтетика до первой свечи реального, дальше реальный с непрерывным масштабом
+    real = make_series("LQDT", _candles(date(2019, 6, 1), [1.0, 1.01, 1.02]))
+    cal = [date(2019, 5, 30), date(2019, 5, 31), date(2019, 6, 1), date(2019, 6, 2), date(2019, 6, 3)]
+    sp = splice_safe(cal, real, key_rate=[(date(2018, 1, 1), 0.10)])
+    assert sp["dates"] == cal and len(sp["close"]) == 5
+    assert close(sp["close"][3] / sp["close"][2], 1.01) and sp["close"][1] <= sp["close"][2]
+    assert sp["tr"] == sp["close"] or close(sp["tr"][-1] / sp["tr"][0], sp["close"][-1] / sp["close"][0])
+    print("bt_data ok")
+
+
 if __name__ == "__main__":
     test_xirr()
     test_ytm_duration()
@@ -227,4 +273,5 @@ if __name__ == "__main__":
     test_reports()
     test_backtest()
     test_sharpe()
+    test_bt_data()
     print("ALL OK")
