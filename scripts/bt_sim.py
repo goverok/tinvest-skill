@@ -3,7 +3,7 @@
 Стратегия вызывается на закрытии дня с View — срезом истории до этого дня; заглянуть вперёд нечем.
 Заявки исполняются на open следующего торгового дня (fill="open") или по его close (fill="next_close"),
 целыми лотами, с комиссией и проскальзыванием на каждую сторону. Дивиденды приходят в кэш на дату выплаты
-за позиции, державшиеся на закрытии перед ex-датой. Налог (tax_rate=None — ИИС): 13% с прибыли года по FIFO,
+за позиции, державшиеся на закрытии перед ex-датой, за вычетом 13 % удержания у источника в обоих режимах. Налог (tax_rate=None — ИИС): 13% с прибыли года по FIFO,
 перенос убытка, ЛДВ > 3 лет; уплата в первый торговый день следующего года, при нехватке кэша — продажей
 пропорционально по всем позициям. В конце окна — ликвидация по close.
 """
@@ -22,6 +22,7 @@ from common import add_years  # noqa: E402
 from finmath import moments, sharpe, xirr  # noqa: E402
 
 COST, SLIP, TAX = 0.0005, 0.001, 0.13
+DIVIDEND_TAX = 0.13  # налог на дивиденды удерживается у источника на любом счёте (ИИС не освобождает)
 Result = Dict[str, Any]
 
 
@@ -68,6 +69,12 @@ def _bar_index(s: Series, d: date) -> Optional[int]:
 
 def _last_close(s: Series, d: date) -> Optional[float]:
     i = bisect.bisect_right(s["dates"], d) - 1
+    return s["close"][i] if i >= 0 else None
+
+
+def _close_before(s: Series, d: date) -> Optional[float]:
+    """Последний close строго до даты d (то, что известно на открытии дня d)."""
+    i = bisect.bisect_left(s["dates"], d) - 1
     return s["close"][i] if i >= 0 else None
 
 
@@ -150,7 +157,11 @@ def simulate(series: Dict[str, Series], strategy: Strategy, params: dict, *, sta
         return series[t][field][i] if i is not None else None
 
     def execute(target: Dict[str, float], d: date, field: str) -> None:
-        total = value(d)
+        def mark(t: str) -> float:  # цена оценки на момент исполнения: цена заявки, иначе вчерашний close
+            px = price(t, d, field)
+            return px if px is not None else (_close_before(series[t], d) or 0.0)
+
+        total = cash + sum(q * mark(t) for t, q in qty.items())
         want = {t: target.get(t, 0.0) for t in tradable}
         want[safe] = max(0.0, 1.0 - sum(v for t, v in want.items() if t != safe))
         orders = []
@@ -158,7 +169,7 @@ def simulate(series: Dict[str, Series], strategy: Strategy, params: dict, *, sta
             px = price(t, d, field)
             if px is None:
                 continue  # бумага сегодня не торгуется — пропускаем
-            cur = qty.get(t, 0.0) * px
+            cur = qty.get(t, 0.0) * mark(t)
             delta = want[t] * total - cur
             if abs(delta) > rebalance_threshold * total or (want[t] == 0 and cur > 0):
                 orders.append((t, px, delta))
@@ -172,12 +183,14 @@ def simulate(series: Dict[str, Series], strategy: Strategy, params: dict, *, sta
                 buy(t, px, d, delta)
 
     prev_year = None
+    prev_d: Optional[date] = None
     for i, d in enumerate(cal):
         # 1. право на дивиденд — по позиции на закрытии перед ex-датой (до сегодняшних сделок)
         for t in uni:
             for dv in series[t]["divs"]:
-                if dv["ex"] == d and qty.get(t, 0.0) > 0:
-                    amt = qty[t] * dv["amount"] * (1 - tax_rate if tax_rate else 1.0)
+                hit = dv["ex"] == d if prev_d is None else prev_d < dv["ex"] <= d  # ex вне календаря IMOEX — на ближайший день
+                if hit and qty.get(t, 0.0) > 0:
+                    amt = qty[t] * dv["amount"] * (1 - DIVIDEND_TAX)
                     pending_div.append((dv["pay"], amt))
         # 2. выплаты, срок которых наступил
         due_now = [p for p in pending_div if p[0] <= d]
@@ -199,6 +212,7 @@ def simulate(series: Dict[str, Series], strategy: Strategy, params: dict, *, sta
             cash -= due
             st["taxes"] += due
         prev_year = d.year
+        prev_d = d
         # 4. заявки, выставленные вчера
         if pending_target is not None:
             execute(pending_target, d, "open" if fill == "open" else "close")

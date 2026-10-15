@@ -354,12 +354,12 @@ def test_bt_sim():
     s2 = dict(series, A=a_div)
     hold_then_sell = lambda v, p, st: {"A": 1.0} if v.today < date(2024, 1, 3) else {}  # noqa: E731
     r = simulate(s2, hold_then_sell, {}, **kw)
-    assert close(r["dividends"], 100.0) and close(r["final"], 1100.0), (r["dividends"], r["final"])
-    # на брокерском счёте дивиденд минус 13%
+    assert close(r["dividends"], 87.0) and close(r["final"], 1087.0), (r["dividends"], r["final"])
+    # дивиденд облагается у источника (13%) на любом счёте, ИИС не освобождает
     r = simulate(s2, hold_then_sell, {}, tax_rate=0.13, **kw)
     assert close(r["dividends"], 87.0), r["dividends"]
 
-    # налог по итогам года: прибыль 200 в 2024 -> 26 в первый день 2025
+    # налог: прибыль 200 в 2024, продажа 03.01.2025 уже в новом году -> 26 удерживается ИТОГОВЫМ расчётом в конце окна
     d1 = date(2024, 12, 30)
     cal = [d1, date(2024, 12, 31), date(2025, 1, 3), date(2025, 1, 6)]
     def _s(t, closes, lot=1):
@@ -371,6 +371,52 @@ def test_bt_sim():
     sig = lambda v, p, st: {"A": 1.0} if v.today == d1 else {}  # noqa: E731
     r = simulate(s3, sig, {}, start=d1, end=cal[-1], capital=1000.0, cost=0.0, slip=0.0, tax_rate=0.13)
     assert close(r["taxes"], 26.0) and close(r["final"], 1174.0), (r["taxes"], r["final"])
+
+    # налоги: общий помощник — серия open=close=цена на произвольном календаре
+    def _sc(t, days, closes):
+        from bt_data import make_series
+        return make_series(t, [{"time": d.isoformat() + "T00:00:00Z", "open": c, "close": c, "high": c, "low": c, "volume": 1}
+                               for d, c in zip(days, closes)])
+
+    def _tax_run(days, a_closes, sig_fn, **extra):
+        ss = {"IMOEX": _sc("IMOEX", days, [1] * len(days)), "LQDT": _sc("LQDT", days, [1] * len(days)),
+              "A": _sc("A", days, a_closes)}
+        return simulate(ss, sig_fn, {}, start=days[0], end=days[-1], capital=1000.0, cost=0.0, slip=0.0, tax_rate=0.13, **extra)
+
+    # смена года: покупка A 30.12 по 10, продажа 31.12 по 12 (прибыль 200 в 2024), снова A -> 03.01 налог 26 платится
+    # принудительной продажей (кэш ~0), а не итоговым расчётом
+    ydays = [date(2024, 12, 27), date(2024, 12, 30), date(2024, 12, 31), date(2025, 1, 3), date(2025, 1, 6)]
+    ysig = lambda v, p, st: {} if v.today == date(2024, 12, 30) else {"A": 1.0}  # noqa: E731
+    r = _tax_run(ydays, [10, 10, 12, 12, 12], ysig)
+    assert close(r["taxes"], 26.0), r["taxes"]
+    assert any(t["side"] == "sell" and t["date"] == date(2025, 1, 3) for t in r["trades"]), r["trades"]
+    assert min(e for _, e in r["equity"]) > 0 and close(r["final"], 1174.0), r["final"]
+
+    # перенос убытка: 2024 -200, 2025 +400 -> налог 0.13 * (400 - 200) = 26
+    cdays = [date(2024, 12, 27), date(2024, 12, 30), date(2024, 12, 31), date(2025, 1, 3), date(2025, 1, 6),
+             date(2025, 1, 7), date(2025, 1, 8)]
+    csig = lambda v, p, st: {"A": 1.0} if v.today in (cdays[0], cdays[3]) else {}  # noqa: E731
+    r = _tax_run(cdays, [10, 10, 8, 8, 8, 12, 12], csig)
+    assert close(r["taxes"], 26.0) and close(r["final"], 1174.0), (r["taxes"], r["final"])
+
+    # ЛДВ: лот куплен 2020-01-10, продан 2023-01-10 (ровно 3 года) с прибылью -> налог 0
+    edays = [date(2020, 1, 9), date(2020, 1, 10), date(2023, 1, 9), date(2023, 1, 10), date(2023, 1, 11)]
+    esig = lambda v, p, st: {} if v.today >= date(2023, 1, 9) else {"A": 1.0}  # noqa: E731
+    r = _tax_run(edays, [10, 10, 15, 15, 15], esig)
+    assert close(r["taxes"], 0.0) and close(r["final"], 1500.0), (r["taxes"], r["final"])
+
+    # дивиденд с ex-датой вне календаря IMOEX (выходная сессия акции) всё равно начисляется
+    odays = [date(2024, 1, 1), date(2024, 1, 2), date(2024, 1, 4), date(2024, 1, 5), date(2024, 1, 6)]
+    o_idx, o_safe = _sc("IMOEX", odays, [1] * 5), _sc("LQDT", odays, [1] * 5)
+    o_a = _series("A", d0, [10] * 6, divs=[{"ex": date(2024, 1, 3), "pay": date(2024, 1, 5), "amount": 1.0}])
+    r = simulate({"IMOEX": o_idx, "LQDT": o_safe, "A": o_a}, lambda v, p, st: {"A": 1.0}, {}, **kw)
+    assert close(r["dividends"], 87.0), r["dividends"]
+
+    # заявка не «знает» close дня исполнения: два прогона, различающихся только close дня 3, совпадают до open дня 3
+    def _look(close3):
+        la = _series("A", d0, [10, 10, close3, 10, 10, 10], opens=[10] * 6)
+        return simulate(dict(series, A=la), lambda v, p, st: {"A": 0.5}, {}, **kw)
+    assert [t for t in _look(10)["trades"] if t["date"] <= date(2024, 1, 3)] ==         [t for t in _look(5)["trades"] if t["date"] <= date(2024, 1, 3)]
 
     # fill: сигнал на закрытии дня 2 -> open дня 3 = 10, close дня 3 = 12
     sig2 = lambda v, p, s: {"A": 1.0} if v.today == date(2024, 1, 2) else {}  # noqa: E731
