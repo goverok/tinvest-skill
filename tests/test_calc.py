@@ -447,6 +447,62 @@ def test_bt_sim():
     print("bt_sim ok")
 
 
+def test_bt_strategies():
+    from bt_sim import View
+    from bt_strategies import FAMILIES, donchian, equal_weight, grid_variants, momentum, random_portfolio, trend_vol
+    d0 = date(2020, 1, 1)
+    n = 300
+    up = _series("UP", d0, [10 + i * 0.1 for i in range(n)])          # ровный рост
+    flat = _series("FL", d0, [10.0] * n)
+    down = _series("DN", d0, [40 - i * 0.1 for i in range(n)])        # падение
+    # последний месяц: UP падает (12-1 должен это пропустить и всё равно выбрать UP по 6 месяцам)
+    up_rev = _series("UR", d0, [10 + i * 0.1 for i in range(n - 21)] + [10 + (n - 21) * 0.1 - i * 0.2 for i in range(21)])
+    idx = _series("IMOEX", d0, [100 + i * 0.1 for i in range(n)])
+    series = {"IMOEX": idx, "UP": up, "FL": flat, "DN": down, "UR": up_rev}
+    today = up["dates"][-1]
+    v = View(series, today, ["UP", "FL", "DN", "UR"])
+
+    w = momentum(v, {"L": 6, "K": 2, "market_filter": 0}, {})
+    assert set(w) == {"UP", "UR"} and close(sum(w.values()), 1.0), w
+    # фильтр: индекс ниже SMA200 -> пусто
+    idx_dn = _series("IMOEX", d0, [200 - i * 0.1 for i in range(n)])
+    assert momentum(View(dict(series, IMOEX=idx_dn), today, ["UP", "FL"]), {"L": 6, "K": 1, "market_filter": 1}, {}) == {}
+    # мало истории -> пусто
+    assert momentum(View(series, up["dates"][30], ["UP"]), {"L": 6, "K": 1, "market_filter": 0}, {}) == {}
+
+    # Donchian: UP на новом максимуме -> вход; FL (не выше max 20) -> нет; удержание через state, выход при пробое вниз
+    st = {}
+    w = donchian(v, {"N": 20, "M": 10, "K": 5}, st)
+    assert "UP" in w and "FL" not in w and "DN" not in w and close(w["UP"], 0.2), w
+    # следующий день: DN продолжает падать (не входим); UP держим
+    w2 = donchian(v, {"N": 20, "M": 10, "K": 5}, st)
+    assert "UP" in w2
+    # выход: серия, которая росла, потом упала ниже min за 10 дней
+    peak = _series("PK", d0, [10 + i * 0.1 for i in range(n - 15)] + [10 + (n - 15) * 0.1 - i * 0.5 for i in range(15)])
+    sp = {"IMOEX": idx, "PK": peak}
+    st = {}
+    donchian(View(sp, peak["dates"][n - 16], ["PK"]), {"N": 20, "M": 10, "K": 5}, st)   # вход на максимуме
+    assert "PK" in st.get("held", {})
+    w3 = donchian(View(sp, peak["dates"][-1], ["PK"]), {"N": 20, "M": 10, "K": 5}, st)  # пробой вниз
+    assert "PK" not in w3
+
+    # trend_vol: обе выше SMA50; менее волатильная получает больший вес; сумма <= 1
+    noisy = _series("NZ", d0, [10 + i * 0.1 + (1.5 if i % 2 else -1.5) for i in range(n)])
+    tv = {"IMOEX": idx, "UP": up, "NZ": noisy, "DN": down}
+    w = trend_vol(View(tv, today, ["UP", "NZ", "DN"]), {"N": 50, "target_vol": 0.15}, {})
+    assert "DN" not in w and w.get("UP", 0) > w.get("NZ", 0) > 0 and sum(w.values()) <= 1.0 + 1e-9, w
+
+    # random: K бумаг, детерминирован по seed, равные веса
+    w = random_portfolio(v, {"K": 2, "seed": 7}, {})
+    assert len(w) == 2 and close(sum(w.values()), 1.0) and w == random_portfolio(v, {"K": 2, "seed": 7}, {})
+    assert equal_weight(v, {}, {}) == {t: 0.25 for t in ["UP", "FL", "DN", "UR"]}
+
+    vs = grid_variants({"a": [1, 2], "b": [0, 1]})
+    assert vs == [{"a": 1, "b": 0}, {"a": 1, "b": 1}, {"a": 2, "b": 0}, {"a": 2, "b": 1}]
+    assert len(grid_variants(FAMILIES["momentum"]["grid"])) == 18 and len(grid_variants(FAMILIES["donchian"]["grid"])) == 12         and len(grid_variants(FAMILIES["trend_vol"]["grid"])) == 9
+    print("bt_strategies ok")
+
+
 if __name__ == "__main__":
     test_xirr()
     test_ytm_duration()
@@ -457,4 +513,5 @@ if __name__ == "__main__":
     test_sharpe()
     test_bt_data()
     test_bt_sim()
+    test_bt_strategies()
     print("ALL OK")
