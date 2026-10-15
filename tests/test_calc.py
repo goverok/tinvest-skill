@@ -530,6 +530,80 @@ def test_bt_strategies():
     print("bt_strategies ok")
 
 
+def test_bt_protocol():
+    import json
+    import bt_protocol as bp
+    # соседи по сетке: ±1 шаг по одной оси
+    grid = {"L": [3, 6, 12], "K": [3, 5, 8]}
+    nb = bp.neighbors({"L": 6, "K": 3}, grid)
+    assert {json.dumps(x, sort_keys=True) for x in nb} == {json.dumps(x, sort_keys=True) for x in
+                                                           [{"L": 3, "K": 3}, {"L": 12, "K": 3}, {"L": 6, "K": 5}]}
+    # плато: пик 1.0 в углу с соседями 0; плато 0.6 с соседями 0.6 -> выбираем плато
+    scores = [({"L": 3, "K": 3}, 1.0), ({"L": 6, "K": 3}, 0.0), ({"L": 3, "K": 5}, 0.0),
+              ({"L": 12, "K": 8}, 0.6), ({"L": 6, "K": 8}, 0.6), ({"L": 12, "K": 5}, 0.6)]
+    best, score = bp.pick_plateau(scores, grid)
+    assert best == {"L": 12, "K": 8} and close(score, 0.6), (best, score)
+    # сетка с одной осью из одного значения — нет деления на ноль
+    best, score = bp.pick_plateau([({"N": 50, "t": 0.1}, 0.5)], {"N": [50], "t": [0.1]})
+    assert best == {"N": 50, "t": 0.1} and close(score, 0.5)
+    assert close(bp.percentile([1, 2, 3, 4], 3.5), 0.75) and close(bp.percentile([], 1.0), 0.0)
+
+    # валидация
+    tr = {"mdd": -0.20}
+    ok, why = bp.validate(tr, {"xirr": 0.20, "sharpe": 1.0, "mdd": -0.25}, {"xirr": 0.10}, [0.1, 0.2, 0.3, 0.4, 0.5])
+    assert ok and not why
+    ok, why = bp.validate(tr, {"xirr": 0.05, "sharpe": 1.0, "mdd": -0.25}, {"xirr": 0.10}, [0.1])
+    assert not ok and any("LQDT" in w for w in why)
+    ok, why = bp.validate(tr, {"xirr": 0.20, "sharpe": 0.1, "mdd": -0.25}, {"xirr": 0.10}, [0.2, 0.3, 0.4, 0.5, 0.6])
+    assert not ok and any("случайн" in w for w in why)
+    ok, why = bp.validate(tr, {"xirr": 0.20, "sharpe": 1.0, "mdd": -0.35}, {"xirr": 0.10}, [0.1])
+    assert not ok and any("просадка" in w for w in why)
+
+    assert bp.years_beating({2020: 0.1, 2021: 0.2, 2022: -0.1}, {2020: 0.05, 2021: 0.3, 2022: 0.05}) == (1, 3)
+    assert close(bp.top2_share({2020: 0.1, 2021: 0.3, 2022: 0.1, 2023: 0.5}), 0.8)
+
+    fam, params = bp.parse_finalist("momentum:L=12,K=5,market_filter=1")
+    assert fam == "momentum" and params == {"L": 12, "K": 5, "market_filter": 1}
+    fam, params = bp.parse_finalist("trend_vol:N=100,target_vol=0.15")
+    assert params == {"N": 100, "target_vol": 0.15}
+
+    # журнал закрытого окна во временной папке
+    os.environ["TINVEST_HOME"] = tempfile.mkdtemp(prefix="tinvest-holdout-")
+    assert bp.record_holdout([("momentum", {"L": 12, "K": 5, "market_filter": 1})]) == []
+    assert bp.record_holdout([("momentum", {"L": 12, "K": 5, "market_filter": 1})]) == []   # те же — не нарушение
+    viol = bp.record_holdout([("momentum", {"L": 6, "K": 5, "market_filter": 1})])
+    assert viol and "momentum" in viol[0]
+    assert len(json.loads(bp.holdout_log_path().read_text(encoding="utf-8"))) == 3
+    del os.environ["TINVEST_HOME"]
+
+    # вердикт
+    v, _ = bp.verdict({"xirr": 0.25, "mdd": -0.2}, {"xirr": 0.22}, {"xirr": 0.18}, {"xirr": 0.05}, {"xirr": 0.08}, -0.2, 0.01)
+    assert v == 1
+    v, _ = bp.verdict({"xirr": 0.15, "mdd": -0.2}, {"xirr": 0.13}, {"xirr": 0.18}, {"xirr": 0.05}, {"xirr": 0.08}, -0.2, 0.01)
+    assert v == 2
+    v, _ = bp.verdict({"xirr": 0.03, "mdd": -0.2}, {"xirr": 0.02}, {"xirr": 0.18}, {"xirr": 0.05}, {"xirr": 0.08}, -0.2, 0.3)
+    assert v == 3
+
+    # сквозной прогон на синтетике: run_variant и random_distribution работают, threshold_rate возвращает число
+    d0 = date(2014, 1, 1)
+    n = 400
+    series = {"IMOEX": _series("IMOEX", d0, [100 + i * 0.05 for i in range(n)]),
+              "LQDT": _series("LQDT", d0, [1 + i * 0.0002 for i in range(n)]),
+              "TMOS": _series("TMOS", d0, [5 + i * 0.002 for i in range(n)]),
+              "A": _series("A", d0, [10 + i * 0.02 for i in range(n)]),
+              "B": _series("B", d0, [10 + (i % 7) * 0.1 for i in range(n)])}
+    win = (d0, series["A"]["dates"][-1])
+    s = bp.run_variant(series, "trend_vol", {"N": 50, "target_vol": 0.15}, win, universe=["A", "B"])
+    assert s["xirr"] is not None and "result" in s
+    dist = bp.random_distribution(series, win, n_runs=3, k=1, universe=["A", "B"])
+    assert len(dist) == 3
+    b = bp.run_benchmark(series, "TMOS", win)
+    assert b["xirr"] is not None and b["in_market"] > 0.9
+    thr = bp.threshold_rate(series, "trend_vol", {"N": 50, "target_vol": 0.15}, win, universe=["A", "B"])
+    assert thr is None or 0.0 < thr < 0.5
+    print("bt_protocol ok")
+
+
 if __name__ == "__main__":
     test_xirr()
     test_ytm_duration()
@@ -541,4 +615,5 @@ if __name__ == "__main__":
     test_bt_data()
     test_bt_sim()
     test_bt_strategies()
+    test_bt_protocol()
     print("ALL OK")
