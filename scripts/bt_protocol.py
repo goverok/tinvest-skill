@@ -109,11 +109,11 @@ def validate(train: dict, valid: dict, lqdt_valid: dict, rand_valid: Sequence[fl
 # ---------- устойчивость ----------
 
 def robustness(series: Dict[str, Series], family: str, params: dict, window: Window,
-               universe: Optional[Sequence[str]] = None) -> Dict[str, Dict[str, Any]]:
+               universe: Optional[Sequence[str]] = None, capital: float = 1_000_000.0) -> Dict[str, Dict[str, Any]]:
     return {
-        "cost_x2": run_variant(series, family, params, window, universe=universe, cost=COST * 2, slip=SLIP * 2),
-        "next_close": run_variant(series, family, params, window, universe=universe, fill="next_close"),
-        "oldest10": run_variant(series, family, params, window, universe=[t for t in OLDEST10 if t in series]),
+        "cost_x2": run_variant(series, family, params, window, universe=universe, cost=COST * 2, slip=SLIP * 2, capital=capital),
+        "next_close": run_variant(series, family, params, window, universe=universe, fill="next_close", capital=capital),
+        "oldest10": run_variant(series, family, params, window, universe=[t for t in OLDEST10 if t in series], capital=capital),
     }
 
 
@@ -167,7 +167,8 @@ def verdict(hold_iis: dict, hold_brk: dict, lqdt_iis: dict, tmos_iis: dict, ew_i
 
 
 def threshold_rate(series: Dict[str, Series], family: str, params: dict, window: Window,
-                   universe: Optional[Sequence[str]] = None, lo: float = 0.02, hi: float = 0.40) -> Optional[float]:
+                   universe: Optional[Sequence[str]] = None, lo: float = 0.02, hi: float = 0.40,
+                   capital: float = 1_000_000.0) -> Optional[float]:
     """Ставка безрискового актива, при которой XIRR стратегии равен XIRR безрискового актива: LQDT заменяется
     синтетикой с постоянной ставкой. Сравнение — по эффективной доходности (XIRR) безрискового пая за то же окно,
     потому что ежедневное начисление даёт эффективную доходность выше номинальной; возвращается номинальная ставка
@@ -179,7 +180,7 @@ def threshold_rate(series: Dict[str, Series], family: str, params: dict, window:
         fake = dict(series)
         fake["LQDT"] = {"ticker": "LQDT", "lot": 1, "dates": cal, "open": syn, "high": syn, "low": syn, "close": syn,
                         "volume": [0.0] * len(syn), "tr": syn, "divs": [], "warnings": []}
-        x = run_variant(fake, family, params, window, universe=universe)["xirr"]
+        x = run_variant(fake, family, params, window, universe=universe, capital=capital)["xirr"]
         if x is None:
             return None
         i0 = next((i for i, d in enumerate(cal) if d >= window[0]), None)

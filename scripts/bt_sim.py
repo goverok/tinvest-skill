@@ -25,6 +25,8 @@ from common import add_years  # noqa: E402
 from finmath import moments, sharpe, xirr  # noqa: E402
 
 COST, SLIP, TAX = 0.0005, 0.001, 0.13
+REBALANCE_THRESHOLD = 0.02  # доля капитала: меньшие отклонения от цели не торгуются
+ACTIVE_GAP_DAYS = 7  # бумага без бара дольше этого срока считается не торгующейся
 DIVIDEND_TAX = 0.13  # налог на дивиденды удерживается у источника на любом счёте (ИИС не освобождает)
 Result = Dict[str, Any]
 
@@ -51,7 +53,7 @@ class View:
     def has(self, t: str, k: int) -> bool:
         return self.n(t) >= k
 
-    def active(self, t: str, max_gap_days: int = 7) -> bool:
+    def active(self, t: str, max_gap_days: int = ACTIVE_GAP_DAYS) -> bool:
         """Бумага торгуется: есть хотя бы один бар, и последний бар не старше max_gap_days от today."""
         e = self._e(t) if t in self._s else 0
         return e > 0 and (self.today - self._s[t]["dates"][e - 1]).days <= max_gap_days
@@ -88,7 +90,7 @@ def _close_before(s: Series, d: date) -> Optional[float]:
 
 def simulate(series: Dict[str, Series], strategy: Strategy, params: dict, *, start: date, end: date,
              universe: Optional[Sequence[str]] = None, capital: float = 1_000_000.0, cost: float = COST,
-             slip: float = SLIP, tax_rate: Optional[float] = None, rebalance_threshold: float = 0.02,
+             slip: float = SLIP, tax_rate: Optional[float] = None, rebalance_threshold: float = REBALANCE_THRESHOLD,
              fill: str = "open", rebalance: str = "daily", safe: str = "LQDT") -> Result:
     cal = [d for d in series["IMOEX"]["dates"] if start <= d <= end]
     if not cal:

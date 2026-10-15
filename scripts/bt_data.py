@@ -137,7 +137,8 @@ def splice_safe(calendar_dates: Sequence[date], real: Optional[Series],
     syn_dates = [d for d in calendar_dates if first_real is None or d < first_real]
     syn = synthetic_safe(syn_dates, key_rate)
     s: Series = {"ticker": "LQDT", "lot": 1, "dates": list(syn_dates), "open": list(syn), "high": list(syn),
-                 "low": list(syn), "close": list(syn), "volume": [0.0] * len(syn), "tr": [], "divs": [], "warnings": []}
+                 "low": list(syn), "close": list(syn), "volume": [0.0] * len(syn), "tr": [], "divs": [], "warnings": [],
+                 "synthetic_until": syn_dates[-1] if syn_dates else None}
     if real and real["dates"]:
         scale = (syn[-1] if syn else 1.0) / real["close"][0]
         for i, d in enumerate(real["dates"]):

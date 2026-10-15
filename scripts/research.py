@@ -17,7 +17,8 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import bt_protocol as bp  # noqa: E402
-from bt_data import OLDEST10, UNIVERSE, load_universe  # noqa: E402
+from bt_data import OLDEST10, SAFE_SPREAD, UNIVERSE, load_universe  # noqa: E402
+from bt_sim import ACTIVE_GAP_DAYS, DIVIDEND_TAX, REBALANCE_THRESHOLD  # noqa: E402
 from bt_strategies import FAMILIES  # noqa: E402
 from common import fmt_money, fmt_pct, load_env, md_table, reports_dir, today  # noqa: E402
 
@@ -74,7 +75,7 @@ def family_section(series, family: str, windows: Dict[str, bp.Window], n_random:
     bench_valid = {b: bp.run_benchmark(series, b, valid, capital=capital, universe=universe) for b in ("LQDT", "TMOS", "equal_weight")}
     rand_valid = bp.random_distribution(series, valid, n_runs=n_random, k=bp.K_RANDOM, universe=universe, capital=capital)
     ok, why = bp.validate(s_train, s_valid, bench_valid["LQDT"], rand_valid)
-    rob = bp.robustness(series, family, finalist, (train[0], valid[1]), universe=universe)
+    rob = bp.robustness(series, family, finalist, (train[0], valid[1]), universe=universe, capital=capital)
     lq_full = bp.run_benchmark(series, "LQDT", (train[0], valid[1]), capital=capital, universe=universe)
     s_full = bp.run_variant(series, family, finalist, (train[0], valid[1]), universe=universe, capital=capital)
     beat, total = bp.years_beating(s_full["yearly"], lq_full["yearly"])
@@ -106,18 +107,20 @@ def train_report(series, families: Sequence[str], n_random: int, capital: float,
                  windows: Optional[Dict[str, bp.Window]] = None, universe: Optional[Sequence[str]] = None) -> Tuple[str, dict]:
     windows = windows or {"TRAIN": bp.TRAIN, "VALID": bp.VALID}
     uni = list(universe) if universe else [t for t in UNIVERSE if t in series]
+    until = series.get("LQDT", {}).get("synthetic_until")
+    lqdt_note = f"до {until} включительно" if until else "до первой реальной свечи"
     out = ["# Исследование стратегий: обучение и валидация", "",
            f"Сформировано {today()}. Капитал {fmt_money(capital)}. Окна: TRAIN {_w(windows['TRAIN'])}, VALID {_w(windows['VALID'])}; "
            f"закрытое окно {_w(bp.HOLDOUT)} в этом отчёте не используется.", "",
            "## Допущения",
-           f"- Издержки {bp.COST:.2%} комиссия + {bp.SLIP:.1%} проскальзывание на сторону; лоты целые; порог ребалансировки 2%.",
-           "- ИИС (без налога с продаж). Дивиденды зачисляются в кэш на дату выплаты за вычетом 13% налога у источника "
-           "в обоих режимах (ИИС тоже); сигналы считаются по полной доходности.",
-           "- Свечи и дивиденды из API уже скорректированы на сплиты. Дивиденды не в рублях (T 2014–2021, RUAL) пропущены — "
-           "см. предупреждения во вселенной.",
-           "- Тикер без свечи за последние 7 дней считается не торгующимся: после паузы февраля–марта 2022 бумаги, "
-           "вернувшиеся позже других (BSPB, SMLT, FLOT, OZON, T, X5, YDEX, SBMX), на 1–2 дня выпадают из портфеля.",
-           "- LQDT до 2020-01-20 — синтетика: ключевая ставка ЦБ − 0,5 п.п.",
+           f"- Издержки {bp.COST:.2%} комиссия + {bp.SLIP:.1%} проскальзывание на сторону; лоты целые; порог ребалансировки {REBALANCE_THRESHOLD:.0%} капитала.",
+           "- ИИС (без налога с продаж). Дивиденды зачисляются в кэш на дату выплаты за вычетом "
+           f"{DIVIDEND_TAX:.0%} налога у источника в обоих режимах (ИИС тоже); сигналы считаются по полной доходности.",
+           "- Свечи и дивиденды из API уже скорректированы на сплиты. Дивиденды не в рублях пропускаются с предупреждением — "
+           "затронутые тикеры в колонке «Предупреждения» таблицы вселенной.",
+           f"- Тикер без свечи за последние {ACTIVE_GAP_DAYS} дней считается не торгующимся: после паузы торгов 2022 года "
+           "это ненадолго исключает бумаги, вернувшиеся позже индекса.",
+           f"- LQDT {lqdt_note} — синтетика: ключевая ставка ЦБ − " + f"{SAFE_SPREAD * 100:.1f}".replace(".", ",") + " п.п.",
            "- Вселенная по сегодняшней ликвидности — survivorship bias; оценка — строка «OLDEST10» в устойчивости.", "",
            "## Вселенная", universe_section(series, uni), ""]
     data = {}
@@ -154,7 +157,7 @@ def holdout_report(series, finalists: List[Tuple[str, dict]], capital: float, vi
         sr_star, p = bp.dsr(iis, bp.TOTAL_TRIALS)
         vm = (valid_mdd or {}).get(fam, iis["mdd"])
         v, text = bp.verdict(iis, brk, bench["ИИС"]["LQDT"], bench["ИИС"]["TMOS"], bench["ИИС"]["equal_weight"], vm, p)
-        thr = bp.threshold_rate(series, fam, params, window, universe=uni) if v == 2 else None
+        thr = bp.threshold_rate(series, fam, params, window, universe=uni, capital=capital) if v == 2 else None
         out += [f"## {name}",
                 md_table(HEAD, [row(f"{name} (ИИС)", iis), row(f"{name} (брокерский)", brk)]
                          + [row(f"{b} (ИИС)", bench["ИИС"][b]) for b in bench["ИИС"]]

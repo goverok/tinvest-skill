@@ -609,6 +609,8 @@ def test_bt_protocol():
     assert b["xirr"] is not None and b["in_market"] > 0.9
     thr = bp.threshold_rate(series, "trend_vol", {"N": 50, "target_vol": 0.15}, win, universe=["A", "B"])
     assert thr is None or 0.0 < thr < 0.5
+    rob = bp.robustness(series, "trend_vol", {"N": 50, "target_vol": 0.15}, win, universe=["A", "B"], capital=1000.0)
+    assert all(r["result"]["capital"] == 1000.0 for r in rob.values()), rob.keys()
     assert thr is None   # на этой фикстуре нет смены знака между 0.02 и 0.40 — ветка «не нашли»
     # скобка есть: стратегия держит только A с постоянным дневным ростом; эталон — независимая бисекция по synthetic_safe
     from bt_data import synthetic_safe
