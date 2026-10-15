@@ -7,7 +7,8 @@
 перенос убытка, ЛДВ > 3 лет; уплата в первый торговый день следующего года, при нехватке кэша — продажей
 пропорционально по всем позициям. В конце окна — ликвидация по close.
 
-Результат simulate: equity, trades, final, costs, taxes, dividends, capital, start, end, in_stocks и
+Результат simulate: equity (оценка на закрытии каждого дня; ликвидация и итоговый налог в неё не входят — только
+в final), trades, final, costs, taxes, dividends, capital, start, end, in_stocks и
 cash_min — минимальный кэш, наблюдавшийся после налогового шага и после исполнения заявок (должен быть >= 0).
 """
 import bisect
@@ -213,13 +214,16 @@ def simulate(series: Dict[str, Series], strategy: Strategy, params: dict, *, sta
         if tax_rate and prev_year is not None and d.year != prev_year:
             due = sum(settle(y) for y in range(prev_year, d.year))
             if due > cash:
-                total_pos = sum(q * (price(t, d, "open") or 0.0) for t, q in qty.items())
-                for t in list(qty):
-                    px = price(t, d, "open")
-                    if px and total_pos > 0:
-                        lot = series[t]["lot"]
-                        q = math.ceil((due - cash) * (qty[t] * px / total_pos) / (px * (1 - slip) * (1 - cost)) / lot) * lot
-                        sell(t, px, d, q)
+                # нехватка считается один раз: sell() меняет cash, и пересчёт в цикле недопродавал бы последние бумаги;
+                # доли — только по бумагам с баром сегодня, чтобы бумага без торгов не оставляла свою часть непокрытой
+                short = due - cash
+                priced = {t: px for t in qty if (px := price(t, d, "open"))}
+                total_pos = sum(qty[t] * px for t, px in priced.items())
+                shares = {t: qty[t] * px / total_pos for t, px in priced.items()} if total_pos > 0 else {}
+                for t, share in shares.items():
+                    px, lot = priced[t], series[t]["lot"]
+                    q = math.ceil(short * share / (px * (1 - slip) * (1 - cost)) / lot) * lot
+                    sell(t, px, d, q)
             cash -= due
             st["taxes"] += due
         cash_min = min(cash_min, cash)
@@ -257,7 +261,8 @@ def simulate(series: Dict[str, Series], strategy: Strategy, params: dict, *, sta
         due = settle(last.year)
         cash -= due
         st["taxes"] += due
-    equity[-1] = (last, cash)
+    # equity[-1] остаётся оценкой на закрытии последнего дня: ликвидация и итоговый налог входят только в final,
+    # иначе налог последнего года попадал бы в просадку и в доходность последнего года
     return {"equity": equity, "trades": trades, "final": cash, "costs": st["costs"], "taxes": st["taxes"],
             "dividends": st["dividends"], "capital": capital, "start": cal[0], "end": last, "in_stocks": in_stocks,
             "cash_min": cash_min}
@@ -294,6 +299,6 @@ def summarize(result: Result, safe_series: Optional[Series] = None) -> Dict[str,
     turnover = sum(t["qty"] * t["price"] for t in result["trades"]) / result["capital"] / years
     return {"final": result["final"], "xirr": xirr([(result["start"], -result["capital"]), (result["end"], result["final"])]),
             "mdd": max_drawdown([v for _, v in eq]), "sharpe": sharpe(rets, rf), "sharpe_daily": (m / sd) if sd else 0.0,
-            "n_obs": len(eq), "skew": sk, "kurt": ku, "trades": len(result["trades"]), "turnover": turnover,
+            "n_obs": len(rets), "skew": sk, "kurt": ku, "trades": len(result["trades"]), "turnover": turnover,
             "in_market": sum(result["in_stocks"]) / len(result["in_stocks"]) if result["in_stocks"] else 0.0,
             "costs": result["costs"], "taxes": result["taxes"], "dividends": result["dividends"], "yearly": yearly(result)}

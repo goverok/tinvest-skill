@@ -9,7 +9,6 @@
 Структура mcp_extra.json — см. пример в tests/ или в документации скилла.
 """
 import argparse
-import json
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path

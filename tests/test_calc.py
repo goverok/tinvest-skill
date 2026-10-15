@@ -251,6 +251,10 @@ def test_bt_data():
     c = _candles(date(2022, 2, 24), [10.0, 10.0])
     c[1]["time"] = "2022-03-25T00:00:00Z"
     assert not any("разрыв" in x for x in check_quality(make_series("Z", c)))
+    # скачок в окрестности обвала 2022 — не подсказка про сплит, а пометка «обвал/возобновление 2022»
+    c = _candles(date(2022, 2, 23), [10.0, 5.0])
+    w = check_quality(make_series("Z", c))
+    assert any("скачок" in x and "2022)" in x for x in w) and not any("SPLITS" in x for x in w), w
     # синтетический LQDT: 10% годовых минус 0.5 п.п., ежедневная капитализация -> за 365 дней между 9.5% и 10%
     days = [date(2019, 1, 1) + __import__("datetime").timedelta(days=i) for i in range(366)]
     v = synthetic_safe(days, [(date(2018, 1, 1), 0.10)])
@@ -394,6 +398,26 @@ def test_bt_sim():
     assert len(jan3) == 1 and jan3[0]["side"] == "sell" and jan3[0]["ticker"] == "LQDT" and close(jan3[0]["qty"], 26.0), jan3
     assert r["cash_min"] >= 0 and min(e for _, e in r["equity"]) > 0 and close(r["final"], 1174.0), (r["cash_min"], r["final"])
 
+    # смена года с ДВУМЯ позициями: 30.12 куплено 1000 A по 1; 31.12 по open 2 продано 500 A (прибыль 500) и куплено
+    # 1000 B по 1, кэш 0. 03.01 налог 65 покрывается продажей пропорционально (A 17 шт по 2 + B 33 шт по 1 = 67),
+    # кэш не уходит в минус. 2025: прибыль 17 (принудительная) + 483 (ликвидация) = 500 -> ещё 65. Итог 2 + 966 + 967 - 65.
+    def _two_run(b_days):
+        ss = {"IMOEX": _sc("IMOEX", ydays, [1] * 5), "LQDT": _sc("LQDT", ydays, [1] * 5),
+              "A": _sc("A", ydays, [1, 1, 2, 2, 2]), "B": _sc("B", b_days, [1] * len(b_days))}
+        sig_ab = lambda v, p, st: {"A": 1.0} if v.today == ydays[0] else {"A": 0.5, "B": 0.5}  # noqa: E731
+        return simulate(ss, sig_ab, {}, start=ydays[0], end=ydays[-1], capital=1000.0, cost=0.0, slip=0.0, tax_rate=0.13)
+    r = _two_run(ydays)
+    assert r["cash_min"] >= 0 and close(r["taxes"], 130.0) and close(r["final"], 1870.0), (r["cash_min"], r["taxes"], r["final"])
+    # B без бара 03.01: его доля перераспределяется на A (33 шт по 2 = 66), кэш не уходит в минус
+    r = _two_run([d for d in ydays if d != date(2025, 1, 3)])
+    jan3 = [t for t in r["trades"] if t["date"] == date(2025, 1, 3)]
+    assert r["cash_min"] >= 0 and [(t["ticker"], t["qty"]) for t in jan3] == [("A", 33)], (r["cash_min"], jan3)
+
+    # брокерский счёт, цены только растут: налог в конце окна входит в final, но не в equity и не в просадку
+    gdays = [date(2024, 3, 1), date(2024, 3, 4), date(2024, 3, 5), date(2024, 3, 6), date(2024, 3, 7)]
+    r = _tax_run(gdays, [10, 10, 11, 12, 12], lambda v, p, st: {"A": 1.0})
+    assert r["taxes"] > 0 and summarize(r)["mdd"] == 0.0 and r["final"] < r["equity"][-1][1], (r["taxes"], r["equity"][-1], r["final"])
+
     # перенос убытка: 2024 -200, 2025 +400 -> налог 0.13 * (400 - 200) = 26
     cdays = [date(2024, 12, 27), date(2024, 12, 30), date(2024, 12, 31), date(2025, 1, 3), date(2025, 1, 6),
              date(2025, 1, 7), date(2025, 1, 8)]
@@ -442,7 +466,7 @@ def test_bt_sim():
     # summarize
     r = simulate(series, half, {}, **kw)
     s = summarize(r, safe_series=safe)
-    assert close(s["final"], 1100.0) and s["xirr"] is not None and s["mdd"] <= 0 and s["n_obs"] == 6 and s["trades"] >= 2
+    assert close(s["final"], 1100.0) and s["xirr"] is not None and s["mdd"] <= 0 and s["n_obs"] == 5 and s["trades"] >= 2
     assert 2024 in s["yearly"] and 0 < s["in_market"] <= 1
     # View.active: бумага, не торгующаяся дольше 7 дней, неактивна
     from bt_sim import View
@@ -526,7 +550,22 @@ def test_bt_strategies():
 
     vs = grid_variants({"a": [1, 2], "b": [0, 1]})
     assert vs == [{"a": 1, "b": 0}, {"a": 1, "b": 1}, {"a": 2, "b": 0}, {"a": 2, "b": 1}]
-    assert len(grid_variants(FAMILIES["momentum"]["grid"])) == 18 and len(grid_variants(FAMILIES["donchian"]["grid"])) == 12         and len(grid_variants(FAMILIES["trend_vol"]["grid"])) == 9
+    assert len(grid_variants(FAMILIES["momentum"]["grid"])) == 18 and len(grid_variants(FAMILIES["donchian"]["grid"])) == 12 \
+        and len(grid_variants(FAMILIES["trend_vol"]["grid"])) == 9
+
+    # дивидендный гэп: close падает на 10 %, tr не меняется -> ни выхода Donchian, ни пробоя SMA;
+    # то же падение без дивиденда (tr падает вместе с close) -> выход и пробой
+    base = [10 + i * 0.01 for i in range(299)]
+    gap_closes = base + [base[-1] * 0.9]
+    no_div = _series("G", d0, gap_closes)
+    with_div = _series("G", d0, gap_closes)
+    with_div["tr"] = no_div["tr"][:-1] + [no_div["tr"][-2]]
+    for s_g, dropped in ((with_div, False), (no_div, True)):
+        vg = View({"IMOEX": idx, "G": s_g}, s_g["dates"][-1], ["G"])
+        st = {"held": {"G": True}}
+        donchian(vg, {"N": 20, "M": 10, "K": 5}, st)
+        assert ("G" not in st["held"]) == dropped, (dropped, st)
+        assert ("G" not in trend_vol(vg, {"N": 50, "target_vol": 0.15}, {})) == dropped, dropped
     print("bt_strategies ok")
 
 
@@ -576,20 +615,48 @@ def test_bt_protocol():
             pass
 
     # журнал закрытого окна во временной папке
-    os.environ["TINVEST_HOME"] = tempfile.mkdtemp(prefix="tinvest-holdout-")
-    assert bp.record_holdout([("momentum", {"L": 12, "K": 5, "market_filter": 1})]) == []
-    assert bp.record_holdout([("momentum", {"L": 12, "K": 5, "market_filter": 1})]) == []   # те же — не нарушение
-    viol = bp.record_holdout([("momentum", {"L": 6, "K": 5, "market_filter": 1})])
-    assert viol and "momentum" in viol[0]
-    assert len(json.loads(bp.holdout_log_path().read_text(encoding="utf-8"))) == 3
-    del os.environ["TINVEST_HOME"]
+    m12 = ("momentum", {"L": 12, "K": 5, "market_filter": 1})
+    m6 = ("momentum", {"L": 6, "K": 5, "market_filter": 1})
+    dn = ("donchian", {"N": 55, "M": 20, "K": 5})
+    old_home = os.environ.get("TINVEST_HOME")
+    try:
+        os.environ["TINVEST_HOME"] = tempfile.mkdtemp(prefix="tinvest-holdout-")
+        assert bp.holdout_trials() == 1                       # пустой журнал — не меньше 1
+        assert bp.record_holdout([m12]) == []
+        assert bp.record_holdout([m12]) == []                 # тот же набор — не нарушение
+        assert bp.holdout_trials() == 1                       # один и тот же финалист дважды
+        viol = bp.record_holdout([m6])
+        assert viol and all("momentum" in v and "L\": 12" in v for v in viol), viol
+        assert len(json.loads(bp.holdout_log_path().read_text(encoding="utf-8"))) == 3
+        assert bp.holdout_trials() == 2                       # два различных финалиста
+        # другое семейство тоже нарушение: ранний набор назван в сообщении
+        os.environ["TINVEST_HOME"] = tempfile.mkdtemp(prefix="tinvest-holdout-")
+        assert bp.record_holdout([m12]) == []
+        viol = bp.record_holdout([dn])
+        assert len(viol) == 1 and "momentum" in viol[0] and "L\": 12" in viol[0], viol
+        # набор из двух — повтор того же набора не нарушение, подмножество — нарушение
+        os.environ["TINVEST_HOME"] = tempfile.mkdtemp(prefix="tinvest-holdout-")
+        assert bp.record_holdout([m12, dn]) == [] and bp.record_holdout([dn, m12]) == []
+        assert bp.record_holdout([m12]) and bp.holdout_trials() == 2
+    finally:
+        if old_home is None:
+            os.environ.pop("TINVEST_HOME", None)
+        else:
+            os.environ["TINVEST_HOME"] = old_home
 
-    # вердикт
-    v, _ = bp.verdict({"xirr": 0.25, "mdd": -0.2}, {"xirr": 0.22}, {"xirr": 0.18}, {"xirr": 0.05}, {"xirr": 0.08}, -0.2, 0.01)
+    # вердикт: (ИИС, брокерский, LQDT ИИС, LQDT брокерский, TMOS, равные веса, просадка VALID, p)
+    lq_i, lq_b, tm, ew = {"xirr": 0.18}, {"xirr": 0.16}, {"xirr": 0.05}, {"xirr": 0.08}
+    v, _ = bp.verdict({"xirr": 0.25, "mdd": -0.2}, {"xirr": 0.22}, lq_i, lq_b, tm, ew, -0.2, 0.01)
     assert v == 1
-    v, _ = bp.verdict({"xirr": 0.15, "mdd": -0.2}, {"xirr": 0.13}, {"xirr": 0.18}, {"xirr": 0.05}, {"xirr": 0.08}, -0.2, 0.01)
+    # ИИС выше LQDT ИИС, но брокерский (0.15) ниже LQDT брокерского (0.16) -> не вердикт 1
+    v, _ = bp.verdict({"xirr": 0.25, "mdd": -0.2}, {"xirr": 0.15}, lq_i, lq_b, tm, ew, -0.2, 0.01)
     assert v == 2
-    v, _ = bp.verdict({"xirr": 0.03, "mdd": -0.2}, {"xirr": 0.02}, {"xirr": 0.18}, {"xirr": 0.05}, {"xirr": 0.08}, -0.2, 0.3)
+    # брокерский 0.17 ниже LQDT ИИС 0.18, но выше LQDT брокерского 0.16 -> вердикт 1
+    v, _ = bp.verdict({"xirr": 0.25, "mdd": -0.2}, {"xirr": 0.17}, lq_i, lq_b, tm, ew, -0.2, 0.01)
+    assert v == 1
+    v, _ = bp.verdict({"xirr": 0.15, "mdd": -0.2}, {"xirr": 0.13}, lq_i, lq_b, tm, ew, -0.2, 0.01)
+    assert v == 2
+    v, _ = bp.verdict({"xirr": 0.03, "mdd": -0.2}, {"xirr": 0.02}, lq_i, lq_b, tm, ew, -0.2, 0.3)
     assert v == 3
 
     # сквозной прогон на синтетике: run_variant и random_distribution работают, threshold_rate возвращает число
@@ -655,8 +722,12 @@ def test_research_report():
     assert data["trend_vol"]["finalist"] in [{"N": n_, "target_vol": v} for n_ in (50, 100, 200) for v in (0.1, 0.15, 0.2)]
     text, data = research.holdout_report(series, [("trend_vol", data["trend_vol"]["finalist"])], capital=1000.0,
                                          violations=["trend_vol: тест"], window=(series["A"]["dates"][401], end),
-                                         valid_mdd={"trend_vol": -0.1}, universe=["A", "B", "C"])
+                                         valid_mdd={"trend_vol": -0.1}, universe=["A", "B", "C"], n_trials=2)
     assert text.startswith("# ") and "Нарушение протокола" in text and "Вердикт" in text and data["verdict"] in (1, 2, 3)
+    assert "при 2 финалистах на закрытом окне" in text, text
+    # у LQDT вместо Sharpe прочерк; в колонке сделок — только сделки с акциями
+    lq_rows = [ln for ln in text.splitlines() if ln.startswith("| LQDT (")]
+    assert lq_rows and all(ln.split(" | ")[4] == "—" and ln.split(" | ")[5] == "0" for ln in lq_rows), lq_rows
     print("research ok")
 
 

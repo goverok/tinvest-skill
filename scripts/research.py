@@ -22,7 +22,8 @@ from bt_sim import ACTIVE_GAP_DAYS, DIVIDEND_TAX, REBALANCE_THRESHOLD  # noqa: E
 from bt_strategies import FAMILIES  # noqa: E402
 from common import fmt_money, fmt_pct, load_env, md_table, reports_dir, today  # noqa: E402
 
-HEAD = ["Вариант", "Итог", "Доходность, год.", "Макс. просадка", "Sharpe", "Сделок/год", "В акциях", "Издержки", "Налог"]
+HEAD = ["Вариант", "Итог", "Доходность, год.", "Макс. просадка", "Sharpe", "Сделок с акциями/год", "В акциях", "Издержки", "Налог"]
+SAFE = "LQDT"
 
 
 def _w(w: bp.Window) -> str:
@@ -34,9 +35,12 @@ def _years(s: dict) -> float:
     return max((r["end"] - r["start"]).days / 365.25, 1e-9)
 
 
-def row(name: str, s: dict) -> List[str]:
-    return [name, fmt_money(s["final"]), fmt_pct(s["xirr"]), fmt_pct(s["mdd"]), f"{s['sharpe'] or 0:.2f}",
-            f"{len(s['result']['trades']) / _years(s):.0f}", fmt_pct(s["in_market"], 0), fmt_money(s["costs"]), fmt_money(s["taxes"])]
+def row(name: str, s: dict, show_sharpe: bool = True) -> List[str]:
+    """Строка таблицы. Сделки — только с акциями (парковка остатка в LQDT не считается); show_sharpe=False — для
+    самого LQDT, где Sharpe относительно LQDT не имеет смысла."""
+    stock_trades = sum(1 for t in s["result"]["trades"] if t["ticker"] != SAFE)
+    return [name, fmt_money(s["final"]), fmt_pct(s["xirr"]), fmt_pct(s["mdd"]), f"{s['sharpe'] or 0:.2f}" if show_sharpe else "—",
+            f"{stock_trades / _years(s):.0f}", fmt_pct(s["in_market"], 0), fmt_money(s["costs"]), fmt_money(s["taxes"])]
 
 
 def _pstr(p: dict) -> str:
@@ -87,7 +91,7 @@ def family_section(series, family: str, windows: Dict[str, bp.Window], n_random:
            f"{s_train['sharpe'] or 0:.2f}; deflated Sharpe: порог {sr_star * (252 ** 0.5):.2f} год., p = {p:.3f} "
            f"при {len(variants)} попытках семейства.", "",
            f"### Валидация ({_w(valid)})",
-           md_table(HEAD, [row(f"{family} {_pstr(finalist)}", s_valid)] + [row(b, bench_valid[b]) for b in bench_valid]), "",
+           md_table(HEAD, [row(f"{family} {_pstr(finalist)}", s_valid)] + [row(b, bench_valid[b], b != SAFE) for b in bench_valid]), "",
            f"Перцентиль среди {len(rand_valid)} случайных портфелей (K={bp.K_RANDOM}): "
            f"{bp.percentile(rand_valid, s_valid['sharpe'] or 0):.0%}. "
            + ("**Прошёл.**" if ok else "**Не прошёл:** " + "; ".join(why)), "",
@@ -139,8 +143,10 @@ def train_report(series, families: Sequence[str], n_random: int, capital: float,
 
 def holdout_report(series, finalists: List[Tuple[str, dict]], capital: float, violations: List[str],
                    window: Optional[bp.Window] = None, valid_mdd: Optional[Dict[str, float]] = None,
-                   universe: Optional[Sequence[str]] = None) -> Tuple[str, dict]:
+                   universe: Optional[Sequence[str]] = None, n_trials: Optional[int] = None) -> Tuple[str, dict]:
+    """n_trials — для deflated Sharpe: число различных финалистов, открывавших окно (по умолчанию — из журнала)."""
     window = window or bp.HOLDOUT
+    n_trials = n_trials or bp.holdout_trials()
     uni = list(universe) if universe else [t for t in UNIVERSE if t in series]
     out = [f"# Закрытое окно ({_w(window)})", ""]
     if violations:
@@ -154,15 +160,17 @@ def holdout_report(series, finalists: List[Tuple[str, dict]], capital: float, vi
         name = f"{fam} {_pstr(params)}"
         iis = bp.run_variant(series, fam, params, window, universe=uni, capital=capital)
         brk = bp.run_variant(series, fam, params, window, universe=uni, capital=capital, tax_rate=bp.TAX_RATE)
-        sr_star, p = bp.dsr(iis, bp.TOTAL_TRIALS)
+        sr_star, p = bp.dsr(iis, n_trials)
         vm = (valid_mdd or {}).get(fam, iis["mdd"])
-        v, text = bp.verdict(iis, brk, bench["ИИС"]["LQDT"], bench["ИИС"]["TMOS"], bench["ИИС"]["equal_weight"], vm, p)
+        v, text = bp.verdict(iis, brk, bench["ИИС"]["LQDT"], bench["брокерский"]["LQDT"], bench["ИИС"]["TMOS"],
+                             bench["ИИС"]["equal_weight"], vm, p)
         thr = bp.threshold_rate(series, fam, params, window, universe=uni, capital=capital) if v == 2 else None
         out += [f"## {name}",
                 md_table(HEAD, [row(f"{name} (ИИС)", iis), row(f"{name} (брокерский)", brk)]
-                         + [row(f"{b} (ИИС)", bench["ИИС"][b]) for b in bench["ИИС"]]
-                         + [row(f"{b} (брокерский)", bench["брокерский"][b]) for b in bench["брокерский"]]), "",
-                f"Deflated Sharpe при {bp.TOTAL_TRIALS} попытках: порог {sr_star * (252 ** 0.5):.2f} год., p = {p:.3f}.",
+                         + [row(f"{b} (ИИС)", bench["ИИС"][b], b != SAFE) for b in bench["ИИС"]]
+                         + [row(f"{b} (брокерский)", bench["брокерский"][b], b != SAFE) for b in bench["брокерский"]]), "",
+                f"Deflated Sharpe при {n_trials} финалистах на закрытом окне (по журналу): порог {sr_star * (252 ** 0.5):.2f} год., "
+                f"p = {p:.3f}.",
                 f"Просадка на VALID: {fmt_pct(vm)} (допуск ×{bp.MDD_TOLERANCE}).",
                 (f"Пороговая ставка LQDT, ниже которой стратегия выигрывает: {fmt_pct(thr)}." if thr is not None else ""),
                 f"**Вердикт {v}.** {text}", ""]

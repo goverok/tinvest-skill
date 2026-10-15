@@ -137,25 +137,47 @@ def holdout_log_path() -> Path:
     return home() / "data" / "backtest" / "holdout_log.json"
 
 
+def _hash(fam: str, params: dict) -> str:
+    return hashlib.sha1(f"{fam}:{_key(params)}".encode()).hexdigest()[:12]
+
+
+def _runs(log: List[dict]) -> Dict[str, List[dict]]:
+    """Записи журнала по запускам; у старых записей без run_id запуском считается отметка времени."""
+    runs: Dict[str, List[dict]] = {}
+    for e in log:
+        runs.setdefault(e.get("run_id") or e["at"], []).append(e)
+    return runs
+
+
 def record_holdout(finalists: List[Tuple[str, dict]]) -> List[str]:
-    """Дописывает журнал; возвращает нарушения: ранее на закрытом окне прогонялись другие варианты семейства."""
+    """Дописывает журнал одним запуском (run_id); возвращает нарушения: ранее окно открывалось с другим НАБОРОМ
+    финалистов (любого семейства). Повтор того же набора — не нарушение."""
     log = read_json(holdout_log_path(), []) or []
+    current = {_hash(f, p) for f, p in finalists}
     violations = []
+    for run_id, entries in _runs(log).items():
+        if {e["hash"] for e in entries} != current:
+            seen = "; ".join(f"{e['family']} {e['params']}" for e in entries)
+            violations.append(f"окно уже открывалось {run_id} с другим набором финалистов: {seen}")
+    run_id = datetime.now(timezone.utc).isoformat()
     for fam, params in finalists:
-        h = hashlib.sha1(f"{fam}:{_key(params)}".encode()).hexdigest()[:12]
-        earlier = [e for e in log if e["family"] == fam and e["hash"] != h]
-        if earlier:
-            seen = ", ".join(sorted({e["params"] for e in earlier}))
-            violations.append(f"{fam}: окно уже открывалось {len(earlier)} раз с другими параметрами ({seen})")
-        log.append({"at": datetime.now(timezone.utc).isoformat(), "family": fam, "params": _key(params), "hash": h})
+        log.append({"at": run_id, "run_id": run_id, "family": fam, "params": _key(params), "hash": _hash(fam, params)})
     write_json(holdout_log_path(), log)
     return violations
 
 
-def verdict(hold_iis: dict, hold_brk: dict, lqdt_iis: dict, tmos_iis: dict, ew_iis: dict,
+def holdout_trials() -> int:
+    """Число различных финалистов, когда-либо открывавших закрытое окно (по журналу), не меньше 1 —
+    n_trials для deflated Sharpe на HOLDOUT."""
+    log = read_json(holdout_log_path(), []) or []
+    return max(1, len({e["hash"] for e in log}))
+
+
+def verdict(hold_iis: dict, hold_brk: dict, lqdt_iis: dict, lqdt_brk: dict, tmos_iis: dict, ew_iis: dict,
             valid_mdd: float, dsr_p: float) -> Tuple[int, str]:
-    x, xb, lq = hold_iis["xirr"] or -1, hold_brk["xirr"] or -1, lqdt_iis["xirr"] or -1
-    beats_lqdt = x > lq and xb > lq
+    """Брокерский режим стратегии сравнивается с LQDT в брокерском режиме (налог с LQDT тоже платится)."""
+    x, xb = hold_iis["xirr"] or -1, hold_brk["xirr"] or -1
+    beats_lqdt = x > (lqdt_iis["xirr"] or -1) and xb > (lqdt_brk["xirr"] or -1)
     mdd_ok = hold_iis["mdd"] >= valid_mdd * MDD_TOLERANCE
     significant = dsr_p < DSR_ALPHA
     if beats_lqdt and mdd_ok and significant:
@@ -229,5 +251,4 @@ def all_variants(family: str) -> List[dict]:
     return grid_variants(FAMILIES[family]["grid"])
 
 
-TOTAL_TRIALS = sum(len(grid_variants(f["grid"])) for f in FAMILIES.values())
 TAX_RATE = TAX

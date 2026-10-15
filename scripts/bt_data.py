@@ -42,6 +42,8 @@ KEY_RATE: List[Tuple[date, float]] = [
 SAFE_SPREAD = 0.005  # LQDT ≈ RUONIA ≈ ключевая − 0.5 п.п.
 HISTORY_FROM = date(2013, 1, 1)  # год прогрева перед TRAIN
 PAUSE_2022 = (date(2022, 2, 25), date(2022, 3, 31))
+# окрестность обвала и паузы 2022: скачки здесь — рынок, а не неучтённый сплит
+CRASH_2022 = (date(2022, 2, 21), date(2022, 4, 8))
 
 
 # ---------- построение серии ----------
@@ -105,7 +107,8 @@ def check_quality(s: Series) -> List[str]:
             out.append(f"{s['ticker']}: разрыв {d0} → {d1}")
         c0, c1 = s["close"][i - 1], s["close"][i]
         if c0 > 0 and abs(c1 / c0 - 1) > 0.30:
-            out.append(f"{s['ticker']}: скачок {d1} {c1 / c0:.2f}× — сплит без записи в SPLITS?")
+            hint = " (обвал/возобновление 2022)" if CRASH_2022[0] <= d1 <= CRASH_2022[1] else " — сплит без записи в SPLITS?"
+            out.append(f"{s['ticker']}: скачок {d1} {c1 / c0:.2f}×{hint}")
     zeros = sum(1 for v in s["volume"] if v == 0)
     if zeros:
         out.append(f"{s['ticker']}: нулевой объём в {zeros} днях")

@@ -18,6 +18,14 @@ BARS_PER_MONTH = 21
 SMA_FILTER_N = 200
 
 
+def _tr_scaled(view: View, t: str, field: str, k: int) -> List[float]:
+    """Последние k значений поля в масштабе полной доходности: цена дня i умножается на (tr_i / close_i) / (tr / close)
+    последнего дня. Так дивидендный гэп (close падает, tr нет) не выглядит падением цены; последний день не меняется."""
+    p, tr, cl = view.last(t, field, k), view.last(t, "tr", k), view.last(t, "close", k)
+    base = cl[-1] / tr[-1]
+    return [p[i] * tr[i] / cl[i] * base for i in range(len(p))]
+
+
 def _market_ok(view: View) -> bool:
     """IMOEX выше своей SMA200 (при нехватке истории — считаем, что нет)."""
     closes = view.last("IMOEX", "close", SMA_FILTER_N)
@@ -40,13 +48,14 @@ def momentum(view: View, p: dict, state: dict) -> Dict[str, float]:
 
 
 def _atr(view: View, t: str, n: int = 20) -> float:
-    hi, lo, cl = view.last(t, "high", n + 1), view.last(t, "low", n + 1), view.last(t, "close", n + 1)
+    hi, lo, cl = _tr_scaled(view, t, "high", n + 1), _tr_scaled(view, t, "low", n + 1), _tr_scaled(view, t, "close", n + 1)
     trs = [max(hi[i] - lo[i], abs(hi[i] - cl[i - 1]), abs(lo[i] - cl[i - 1])) for i in range(1, len(cl))]
     return sum(trs) / len(trs) if trs else 0.0
 
 
 def donchian(view: View, p: dict, state: dict) -> Dict[str, float]:
-    """Пробой: вход на close выше max(high, N) предыдущих дней, выход на close ниже min(low, M). K слотов."""
+    """Пробой: вход на close выше max(high, N) предыдущих дней, выход на close ниже min(low, M). K слотов.
+    Цены — в масштабе полной доходности (_tr_scaled), чтобы дивидендный гэп не был пробоем вниз."""
     held: Dict[str, bool] = state.setdefault("held", {})
     n, m, k = p["N"], p["M"], p["K"]
     for t in list(held):  # выходы
@@ -55,14 +64,14 @@ def donchian(view: View, p: dict, state: dict) -> Dict[str, float]:
             continue
         if not view.has(t, m + 1):
             continue
-        lows = view.last(t, "low", m + 1)[:-1]
+        lows = _tr_scaled(view, t, "low", m + 1)[:-1]
         if view.at(t, "close") < min(lows):
             del held[t]
     candidates = []
     for t in view.universe:
         if t in held or not view.active(t) or not view.has(t, n + 1):
             continue
-        highs = view.last(t, "high", n + 1)[:-1]
+        highs = _tr_scaled(view, t, "high", n + 1)[:-1]
         c = view.at(t, "close")
         if c > max(highs):
             atr = _atr(view, t)
@@ -75,16 +84,17 @@ def donchian(view: View, p: dict, state: dict) -> Dict[str, float]:
 
 
 def trend_vol(view: View, p: dict, state: dict) -> Dict[str, float]:
-    """Бумага в портфеле, если close > SMA(N); вес ∝ 1/σ20, масштаб под целевую годовую волатильность, сумма <= 1."""
+    """Бумага в портфеле, если close > SMA(N); вес ∝ 1/σ20, масштаб под целевую годовую волатильность, сумма <= 1.
+    SMA и σ20 — по ценам в масштабе полной доходности (_tr_scaled)."""
     n, target = p["N"], p["target_vol"]
     inv = {}
     for t in view.universe:
         if not view.active(t) or not view.has(t, max(n, 22)):
             continue
-        closes = view.last(t, "close", n)
+        closes = _tr_scaled(view, t, "close", n)
         if closes[-1] <= sum(closes) / n:
             continue
-        c20 = view.last(t, "close", 21)
+        c20 = _tr_scaled(view, t, "close", 21)
         rets = [c20[i] / c20[i - 1] - 1 for i in range(1, len(c20))]
         _, sd, _, _ = moments(rets)
         if sd > 0:
