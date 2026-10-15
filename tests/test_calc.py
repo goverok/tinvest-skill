@@ -136,6 +136,33 @@ def _bar(d, ro, rc, so, sc):
     return {"date": d, "risk_open": ro, "risk_close": rc, "safe_open": so, "safe_close": sc}
 
 
+def test_fetch_targets():
+    """Бумаги из targets.yaml, уже лежащие в кэше справочника, всё равно попадают в запрос цен."""
+    from fetch import fetch_targets
+    from common import write_json
+
+    class Api:
+        def __init__(self):
+            self.finds = []
+
+        def find_instrument(self, q):
+            self.finds.append(q)
+            return [{"ticker": q, "classCode": "TQTF", "instrumentType": "etf", "uid": "u-" + q}]
+
+        def get_instrument(self, uid):
+            return {"uid": uid}
+
+    d = Path(tempfile.mkdtemp(prefix="tinvest-targets-"))
+    yml = ['groups:', '  - name: A', '    weight: 100', '    items:', '      - {ticker: SBMX, weight: 50}', '      - {ticker: NEW, weight: 50}']
+    (d / "t.yaml").write_text(chr(10).join(yml) + chr(10), encoding="utf-8")
+    write_json(d / "targets_instruments.json", {"SBMX": {"ticker": "SBMX", "uid": "u-SBMX", "instrumentType": "etf"}})
+    api, uids = Api(), set()
+    fetch_targets(api, d, str(d / "t.yaml"), {"instruments": {}, "bonds": {}}, uids)
+    assert uids == {"u-SBMX", "u-NEW"}, uids
+    assert api.finds == ["NEW"], api.finds          # кэш справочника не перезапрашивается
+    print("fetch_targets ok")
+
+
 def test_backtest():
     from backtest import align_states, max_drawdown, simulate, trend_states
     # SMA(3): прогрев -> None; 10 = SMA -> не выше -> вне рынка; 13 > 11 -> в рынке; 7 < 10 -> вне
@@ -766,6 +793,7 @@ if __name__ == "__main__":
     test_fifo()
     test_allocate()
     test_reports()
+    test_fetch_targets()
     test_backtest()
     test_sharpe()
     test_bt_data()

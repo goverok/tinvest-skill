@@ -191,7 +191,11 @@ def fetch_targets(api: TInvest, dd: Path, targets_path: Optional[str], cache: Di
     for g in cfg.get("groups", []):
         for it in g.get("items", []):
             ticker = str(it.get("ticker", "")).strip()
-            if not ticker or ticker.upper() == "CASH" or ticker in by_ticker:
+            if not ticker or ticker.upper() == "CASH":
+                continue
+            if ticker in by_ticker:  # справочник уже в кэше, но цена нужна свежая
+                if by_ticker[ticker].get("uid"):
+                    uids_all.add(by_ticker[ticker]["uid"])
                 continue
             try:
                 found = api.find_instrument(ticker)
