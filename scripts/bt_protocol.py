@@ -149,10 +149,12 @@ def _runs(log: List[dict]) -> Dict[str, List[dict]]:
     return runs
 
 
-def record_holdout(finalists: List[Tuple[str, dict]]) -> List[str]:
+def record_holdout(finalists: List[Tuple[str, dict]], path: Optional[Path] = None) -> List[str]:
     """Дописывает журнал одним запуском (run_id); возвращает нарушения: ранее окно открывалось с другим НАБОРОМ
-    финалистов (любого семейства). Повтор того же набора — не нарушение."""
-    log = read_json(holdout_log_path(), []) or []
+    финалистов (любого семейства). Повтор того же набора — не нарушение.
+    path — свой журнал (облигации); по умолчанию журнал исследования акций."""
+    path = path or holdout_log_path()
+    log = read_json(path, []) or []
     current = {_hash(f, p) for f, p in finalists}
     violations = []
     for run_id, entries in _runs(log).items():
@@ -162,14 +164,14 @@ def record_holdout(finalists: List[Tuple[str, dict]]) -> List[str]:
     run_id = datetime.now(timezone.utc).isoformat()
     for fam, params in finalists:
         log.append({"at": run_id, "run_id": run_id, "family": fam, "params": _key(params), "hash": _hash(fam, params)})
-    write_json(holdout_log_path(), log)
+    write_json(path, log)
     return violations
 
 
-def holdout_trials() -> int:
+def holdout_trials(path: Optional[Path] = None) -> int:
     """Число различных финалистов, когда-либо открывавших закрытое окно (по журналу), не меньше 1 —
     n_trials для deflated Sharpe на HOLDOUT."""
-    log = read_json(holdout_log_path(), []) or []
+    log = read_json(path or holdout_log_path(), []) or []
     return max(1, len({e["hash"] for e in log}))
 
 
@@ -227,11 +229,12 @@ def threshold_rate(series: Dict[str, Series], family: str, params: dict, window:
     return (lo + hi) / 2
 
 
-def parse_finalist(spec: str) -> Tuple[str, dict]:
+def parse_finalist(spec: str, families: Optional[Dict[str, Any]] = None) -> Tuple[str, dict]:
+    families = families or FAMILIES
     fam, _, rest = spec.partition(":")
-    if fam not in FAMILIES:
-        raise ValueError(f"неизвестное семейство {fam}; есть: {', '.join(FAMILIES)}")
-    grid = FAMILIES[fam]["grid"]
+    if fam not in families:
+        raise ValueError(f"неизвестное семейство {fam}; есть: {', '.join(families)}")
+    grid = families[fam]["grid"]
     params = {}
     for kv in rest.split(","):
         k, _, v = kv.partition("=")
@@ -247,8 +250,8 @@ def parse_finalist(spec: str) -> Tuple[str, dict]:
     return fam, params
 
 
-def all_variants(family: str) -> List[dict]:
-    return grid_variants(FAMILIES[family]["grid"])
+def all_variants(family: str, families: Optional[Dict[str, Any]] = None) -> List[dict]:
+    return grid_variants((families or FAMILIES)[family]["grid"])
 
 
 TAX_RATE = TAX

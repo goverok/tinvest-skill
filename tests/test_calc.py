@@ -1001,6 +1001,60 @@ def test_research_report():
     print("research ok")
 
 
+def _bond_series(n=550, d0=date(2020, 1, 1)):
+    """Синтетика облигационной части: индексы растут с разной скоростью и месячной «волной», ставка 6%, КБД 6.5%."""
+    import bond_rules as br
+    import moex_iss as mi
+    from datetime import timedelta
+    days = [d0 + timedelta(days=i) for i in range(n)]
+
+    def lvl(t, vals):
+        return mi._series(t, days, vals)
+
+    s = {"RGBITR": lvl("RGBITR", [100.0 * 1.0004 ** i for i in range(n)]),
+         "LQDT": lvl("LQDT", [1.0003 ** i for i in range(n)]), "KEYRATE": lvl("KEYRATE", [0.06] * n)}
+    s["RGBITR"]["duration"], s["RGBITR"]["yield"] = [4.0] * n, [0.07] * n
+    for k, b in enumerate(br.BUCKETS):
+        s[b] = lvl(b, [100.0 * (1.0002 + 0.0001 * k) ** i * (1 + 0.01 * ((i // 30) % 2)) for i in range(n)])
+        s[b]["duration"], s[b]["yield"] = [float(k + 1)] * n, [0.065 + 0.001 * k] * n
+    for t in mi.ZCYC_TICKERS.values():
+        s[t] = lvl(t, [0.065] * n)
+    return s
+
+
+def test_bond_research():
+    import bond_research as bres
+    import bond_rules as br
+    import bt_protocol as bp
+    old_home = os.environ.get("TINVEST_HOME")
+    try:
+        os.environ["TINVEST_HOME"] = tempfile.mkdtemp(prefix="tinvest-bonds-")
+        s = _bond_series()
+        windows = {"TRAIN": (date(2020, 1, 1), date(2020, 12, 31)), "VALID": (date(2021, 1, 1), date(2021, 6, 30)),
+                   "HOLDOUT": (date(2021, 1, 1), date(2021, 7, 3))}
+        text, data = bres.train_report(s, ["curve"], 3, 1_000_000.0, windows)
+        assert "Финалист" in text and br.CURRENT_NAME in text and "Допущения" in text, text[:500]
+        assert data["curve"]["finalist"] in bp.all_variants("curve", br.FAMILIES)
+        # журнал облигаций — свой файл; журнал акций не создаётся
+        fam, params = bp.parse_finalist("curve:bucket=OFZ10Y,s=0.01", br.FAMILIES)
+        assert (fam, params) == ("curve", {"bucket": "OFZ10Y", "s": 0.01})
+        assert bp.record_holdout([(fam, params)], bres.holdout_log()) == []
+        assert bres.holdout_log().exists() and not bp.holdout_log_path().exists()
+        assert bp.holdout_trials(bres.holdout_log()) == 1
+        assert bp.record_holdout([("curve", {"bucket": "OFZ5Y", "s": 0.01})], bres.holdout_log())   # другой набор — нарушение
+        text, hd = bres.holdout_report(s, [(fam, params)], 1_000_000.0, [], n_trials=2, windows=windows)
+        assert "Вердикт" in text and hd["verdict"] in (1, 2, 3) and hd["results"][0]["params"] == params
+        # правило, не обыгравшее «как сейчас», не получает вердикт 1–2
+        cur = {"xirr": 0.10}
+        assert bres.cap_verdict(1, "x", {"xirr": 0.09}, cur)[0] == 3 and bres.cap_verdict(2, "x", {"xirr": 0.11}, cur) == (2, "x")
+    finally:
+        if old_home is None:
+            os.environ.pop("TINVEST_HOME", None)
+        else:
+            os.environ["TINVEST_HOME"] = old_home
+    print("bond_research ok")
+
+
 if __name__ == "__main__":
     test_xirr()
     test_ytm_duration()
@@ -1018,4 +1072,5 @@ if __name__ == "__main__":
     test_moex_iss()
     test_bond_series()
     test_bond_rules()
+    test_bond_research()
     print("ALL OK")
