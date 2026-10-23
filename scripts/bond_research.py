@@ -382,13 +382,13 @@ def advise_report(series, finalists: Dict[str, Any], holdout: Dict[str, Any], he
                          [[r["ticker"], f"{r['next_coupon'][0]}: {fmt_money(r['next_coupon'][1], digits=2)}"
                            if r.get("next_coupon") and r["next_coupon"][1] else "—",
                            str(r["maturity"]), fmt_money(r["turnover"])] for r in fl]) if fl else "Ликвидных флоатеров нет.", ""]
-    repl = {b: v[0]["ticker"] for b, v in by.items() if v}  # заменитель фикс-купонного выпуска — только фикс-купонный
+    repl = {b: [r["ticker"] for r in v] for b, v in by.items() if v}  # заменители фикс-купонного выпуска — только фикс-купонные
     if fl:
-        repl[FLOAT_KEY] = fl[0]["ticker"]  # флоатер заменяет только флоатер
+        repl[FLOAT_KEY] = [r["ticker"] for r in fl]  # флоатер заменяет только флоатер
     if rec:
         sleeve = (ba.current_weights(cfg_groups)[1] if cfg_groups else 0.0) or 50.0
         buy = {b: [r["ticker"] for r in by.get(b, [])[:2]] for b in ("OFZ3Y", "OFZ5Y", "OFZ10Y")}
-        short = repl.get(FLOAT_KEY) or repl.get("OFZ1Y")  # группа «Флоатеры и корпоративные»: флоатер, иначе короткая ОФЗ
+        short = (repl.get(FLOAT_KEY) or repl.get("OFZ1Y") or [None])[0]  # группа «Флоатеры и корпоративные»: флоатер, иначе короткая ОФЗ
         buy["OFZ1Y"] = [short] if short else []
         groups = ba.fragment_groups(rec, sleeve, buy, hold_zero)
         notes = [f"Деление по правилу {rec_name}; облигационная часть {sleeve:g}% портфеля."]

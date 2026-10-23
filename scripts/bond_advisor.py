@@ -141,27 +141,54 @@ def current_weights(groups: Sequence[Dict[str, Any]]) -> Tuple[Dict[str, float],
 
 
 def replace_maturing(groups: Sequence[Dict[str, Any]], maturing: Dict[str, str],
-                     repl: Dict[str, str]) -> Tuple[List[Dict[str, Any]], List[str]]:
-    """Облигационные группы targets.yaml с заменой гасящихся выпусков: вес выпуска переходит кандидату его корзины
-    (repl: корзина -> тикер), сам выпуск остаётся с весом 0. Остальные группы не возвращаются."""
-    out, notes = [], []
+                     repl: Dict[str, List[str]]) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Облигационные группы targets.yaml, где гасящийся выпуск всегда заканчивает с весом 0: вес переходит первому
+    подходящему кандидату его корзины (repl: корзина -> тикеры по убыванию предпочтения; тикер, уже стоящий в другой
+    группе, пропускается), а если такого нет — уходит в LQDT группы «Денежный рынок». Остальные группы не возвращаются."""
+    bond = [g for g in groups if g["name"] in GROUP_TO_BUCKET]
+    st = {g["name"]: {"weight": float(g["weight"]), "items": {i["ticker"]: float(i["weight"]) for i in g["items"]}} for g in bond}
+    holder: Dict[str, str] = {}
     for g in groups:
-        if g["name"] not in GROUP_TO_BUCKET:
-            continue
-        elsewhere = {i["ticker"] for g2 in groups if g2 is not g for i in g2["items"]}  # тикер не должен быть в двух группах
-        items: Dict[str, float] = {}
-        for it in g["items"]:
-            t, w = it["ticker"], float(it["weight"])
-            new = repl.get(maturing.get(t, ""))
-            if new in elsewhere:
-                new = None
-            if t in maturing and w > 0 and new:
-                items[t] = 0.0
-                items[new] = items.get(new, 0.0) + w
-                notes.append(f"{t} гасится в ближайшие 12 месяцев — вес {_num(w)} передан {new}")
+        for i in g["items"]:
+            holder.setdefault(i["ticker"], g["name"])
+    notes: List[str] = []
+    to_cash, shifted = 0.0, set()
+    for g in bond:
+        s = st[g["name"]]
+        gw0, iw0 = s["weight"], sum(s["items"].values())
+        for t, w in list(s["items"].items()):
+            if t not in maturing or w <= 0:
+                continue
+            skipped, new = [], None
+            for c in repl.get(maturing[t], []):
+                if c != t and holder.get(c, g["name"]) != g["name"]:
+                    skipped.append((c, holder[c]))
+                elif c != t:
+                    new = c
+                    break
+            s["items"][t] = 0.0
+            why = f"замена {skipped[0][0]} уже в группе {skipped[0][1]} → " if skipped else ""
+            if new:
+                s["items"][new] = s["items"].get(new, 0.0) + w
+                holder[new] = g["name"]
+                notes.append(f"{t} гасится в ближайшие 12 месяцев — {why}{'взят следующий кандидат ' if skipped else 'вес ' + _num(w) + ' передан '}{new}")
             else:
-                if t in maturing and w > 0:
-                    notes.append(f"{t} гасится, ликвидной замены в корзине {maturing[t]} нет")
-                items[t] = items.get(t, 0.0) + w
-        out.append({"name": g["name"], "weight": float(g["weight"]), "items": [{"ticker": t, "weight": w} for t, w in items.items()]})
+                shift = gw0 * w / iw0
+                s["weight"] -= shift
+                to_cash += shift
+                shifted.add(g["name"])
+                notes.append(f"{t} гасится в ближайшие 12 месяцев — {why}доля перенесена в LQDT: нет подходящей замены")
+    for name in shifted:  # внутри группы с весом > 0 снова 100
+        items = st[name]["items"]
+        pos = sum(items.values())
+        if pos > 0:
+            st[name]["items"] = {t: w / pos * 100.0 for t, w in items.items()}
+    if to_cash > 0:
+        cash = st.setdefault(GROUP_CASH, {"weight": 0.0, "items": {}})
+        iw = sum(cash["items"].values())
+        ab = {t: (w / iw * cash["weight"] if iw > 0 else 0.0) for t, w in cash["items"].items()}
+        ab["LQDT"] = ab.get("LQDT", 0.0) + to_cash
+        cash["weight"] += to_cash
+        cash["items"] = {t: a / cash["weight"] * 100.0 for t, a in ab.items()}
+    out = [{"name": n, "weight": s["weight"], "items": [{"ticker": t, "weight": w} for t, w in s["items"].items()]} for n, s in st.items()]
     return out, notes

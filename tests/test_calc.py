@@ -1109,14 +1109,22 @@ def test_bond_advisor():
                   {"name": ba.GROUP_CASH, "weight": 5.0, "items": [{"ticker": "LQDT", "weight": 100.0}]}]
     w, sleeve = ba.current_weights(cur_groups)
     assert close(sleeve, 50.0) and close(w["OFZ10Y"], 0.7) and close(w["OFZ1Y"], 0.2) and close(w["LQDT"], 0.1), (w, sleeve)
-    new, notes = ba.replace_maturing(cur_groups, {"F": "OFZ1Y"}, {"OFZ1Y": "D"})
+    new, notes = ba.replace_maturing(cur_groups, {"F": "OFZ1Y"}, {"OFZ1Y": ["D"]})
     short = [x for x in new if x["name"] == ba.GROUP_SHORT][0]
     assert {i["ticker"]: i["weight"] for i in short["items"]} == {"F": 0.0, "D": 100.0} and notes
     assert all(x["name"] != "Акции РФ" for x in new)
     dup = [dict(g_, items=list(g_["items"])) for g_ in cur_groups]
     dup[1]["items"].append({"ticker": "D", "weight": 0.0})  # D уже в другой группе — туда замену не ставим
-    new2, _ = ba.replace_maturing(dup, {"F": "OFZ1Y"}, {"OFZ1Y": "D"})
-    assert "D" not in [i["ticker"] for i in [x for x in new2 if x["name"] == ba.GROUP_SHORT][0]["items"]]
+    new2, n2 = ba.replace_maturing(dup, {"F": "OFZ1Y"}, {"OFZ1Y": ["D", "E"]})  # D занят в другой группе -> берём E
+    sh2 = {i["ticker"]: i["weight"] for i in [x for x in new2 if x["name"] == ba.GROUP_SHORT][0]["items"]}
+    assert sh2 == {"F": 0.0, "E": 100.0} and any("D" in n and "E" in n for n in n2), (sh2, n2)
+    new3, n3 = ba.replace_maturing(dup, {"F": "OFZ1Y"}, {})  # замены нет -> доля 10 из 50 уходит в LQDT
+    g3 = {x["name"]: x for x in new3}
+    assert close(g3[ba.GROUP_SHORT]["weight"], 0.0) and {i["ticker"]: i["weight"] for i in g3[ba.GROUP_SHORT]["items"]} == {"F": 0.0}
+    assert close(g3[ba.GROUP_CASH]["weight"], 15.0) and {i["ticker"]: i["weight"] for i in g3[ba.GROUP_CASH]["items"]} == {"LQDT": 100.0}
+    assert close(sum(x["weight"] for x in new3), 50.0) and any("LQDT" in n for n in n3), (g3, n3)
+    new4, _ = ba.replace_maturing(dup, {"F": "OFZ1Y"}, {"OFZ1Y": ["D"]})  # единственный кандидат занят -> тоже LQDT
+    assert close({x["name"]: x for x in new4}[ba.GROUP_CASH]["weight"], 15.0)
     # советник: сигнал финалиста с вердиктом 2 становится рекомендацией; без финалистов — текущая структура
     s = _bond_series()
     fin = {"curve": {"params": {"bucket": "OFZ10Y", "s": -0.01}, "passed": True}}
