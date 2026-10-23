@@ -163,6 +163,60 @@ def test_fetch_targets():
     print("fetch_targets ok")
 
 
+def test_moex_iss():
+    import moex_iss as mi
+    page = {"history": {"columns": ["TRADEDATE", "CLOSE", "DURATION", "YIELD"],
+                        "data": [["2014-01-08", 118.2, 160, 5.95], ["2014-01-09", None, 159, 5.98], ["2014-01-10", 118.3, 158, 6.0]]},
+            "history.cursor": {"columns": ["INDEX", "TOTAL", "PAGESIZE"], "data": [[100, 3215, 100]]}}
+    rows, nxt, total = mi.parse_index_page(page)
+    assert [r["date"] for r in rows] == ["2014-01-08", "2014-01-10"] and nxt == 200 and total == 3215, (rows, nxt, total)
+    assert close(rows[0]["yield"], 0.0595) and rows[0]["duration"] == 160.0
+    z = {"yearyields": {"columns": ["tradedate", "period", "value"], "data": [["2014-01-31", 1.0, 6.543], ["2014-01-31", 10.0, 8.1]]}}
+    d, c = mi.parse_zcyc(z)
+    assert d == "2014-01-31" and close(c[1.0], 0.06543) and close(c[10.0], 0.081), (d, c)
+    assert mi.parse_zcyc({"yearyields": {"columns": ["tradedate", "period", "value"], "data": []}}) == (None, {})
+    xml = ('<KR diffgr:id="KR1"><DT>2026-10-15T00:00:00+03:00</DT><Rate>14.00</Rate></KR>'
+           '<KR diffgr:id="KR2"><DT>2026-10-14T00:00:00+03:00</DT><Rate>16.50</Rate></KR>')
+    kr = mi.parse_key_rate(xml)
+    assert [d for d, _ in kr] == ["2026-10-14", "2026-10-15"] and close(kr[0][1], 0.165) and close(kr[1][1], 0.14), kr
+    assert mi.month_ends(["2014-01-30", "2014-01-31", "2014-02-03", "2014-02-28", "2014-03-03"]) == ["2014-01-31", "2014-02-28", "2014-03-03"]
+    merged = mi.merge_rows([{"date": "2014-01-08", "close": 1.0}, {"date": "2014-01-09", "close": 2.0}],
+                           [{"date": "2014-01-09", "close": 2.5}, {"date": "2014-01-10", "close": 3.0}])
+    assert [r["close"] for r in merged] == [1.0, 2.5, 3.0]
+    # сеть недоступна: кэш используется, без кэша — SystemExit
+    import requests
+    from common import write_json
+    old_home = os.environ.get("TINVEST_HOME")
+    saved = (mi.fetch_index, mi.fetch_zcyc, mi.fetch_key_rate)
+
+    def down(*a, **k):
+        raise requests.ConnectionError("нет сети")
+
+    try:
+        os.environ["TINVEST_HOME"] = tempfile.mkdtemp(prefix="tinvest-iss-")
+        mi.fetch_index = mi.fetch_zcyc = mi.fetch_key_rate = down
+        try:
+            mi.load()
+            raise AssertionError("без кэша и сети должен быть SystemExit")
+        except SystemExit:
+            pass
+        bd = mi.bonds_dir()
+        for ix in mi.INDICES:
+            write_json(bd / f"{ix}.json", [{"date": "2014-01-31", "close": 100.0, "duration": 100.0, "yield": 0.06}])
+        write_json(bd / "zcyc.json", {"2014-01-31": {"1.0": 0.065, "10.0": 0.081}})
+        write_json(bd / "key_rate.json", [["2014-01-31", 0.055]])
+        raw = mi.load()
+        assert raw["indices"]["RGBITR"][0]["close"] == 100.0 and raw["zcyc"]["2014-01-31"][10.0] == 0.081
+        assert raw["key_rate"] == [("2014-01-31", 0.055)]
+    finally:
+        mi.fetch_index, mi.fetch_zcyc, mi.fetch_key_rate = saved
+        if old_home is None:
+            os.environ.pop("TINVEST_HOME", None)
+        else:
+            os.environ["TINVEST_HOME"] = old_home
+    print("moex_iss ok")
+
+
 def test_backtest():
     from backtest import align_states, max_drawdown, simulate, trend_states
     # SMA(3): прогрев -> None; 10 = SMA -> не выше -> вне рынка; 13 > 11 -> в рынке; 7 < 10 -> вне
@@ -801,4 +855,5 @@ if __name__ == "__main__":
     test_bt_strategies()
     test_bt_protocol()
     test_research_report()
+    test_moex_iss()
     print("ALL OK")
