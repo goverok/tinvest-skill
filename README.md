@@ -54,6 +54,7 @@ report.py deploy 400000         план покупок в лотах под tar
 report.py all                   audit + tax по всем счетам
 fetch.py [--sandbox] [--targets ~/.tinvest/targets.yaml]   выгрузка данных
 research.py fetch|train|holdout <финалисты>|all   исследование стратегий (см. SKILL.md)
+bond_research.py fetch|train|holdout|advise|all   облигационная часть: правило дюрации и советник (см. SKILL.md)
 ```
 
 Данные обновляются сами, если выгрузке больше 12 часов; `--refresh` обновляет принудительно.
