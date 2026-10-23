@@ -134,6 +134,10 @@ class TInvest:
         return self.call("InstrumentsService", "BondBy",
                          {"idType": "INSTRUMENT_ID_TYPE_UID", "id": uid}).get("instrument", {})
 
+    def list_bonds(self) -> List[Dict[str, Any]]:
+        """Справочник облигаций, доступных для торговли (InstrumentsService/Bonds)."""
+        return self.call("InstrumentsService", "Bonds", {"instrumentStatus": "INSTRUMENT_STATUS_BASE"}).get("instruments", [])
+
     def get_share(self, uid: str) -> Dict[str, Any]:
         return self.call("InstrumentsService", "ShareBy",
                          {"idType": "INSTRUMENT_ID_TYPE_UID", "id": uid}).get("instrument", {})

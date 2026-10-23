@@ -10,20 +10,23 @@
 Отчёты: ~/.tinvest/reports/bonds_train.md, bonds_holdout.md, bonds_advise.md. Ничего не покупает и не продаёт.
 """
 import argparse
+import json
 import sys
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
+import bond_advisor as ba  # noqa: E402
 import bond_rules as br  # noqa: E402
 import bt_protocol as bp  # noqa: E402
 import moex_iss as mi  # noqa: E402
 from bt_data import SAFE_SPREAD, load_universe  # noqa: E402
-from bt_sim import REBALANCE_THRESHOLD, TAX, simulate, summarize  # noqa: E402
-from common import fmt_money, fmt_pct, load_env, md_table, reports_dir, today, write_json  # noqa: E402
+from bt_sim import REBALANCE_THRESHOLD, TAX, View, simulate, summarize  # noqa: E402
+from common import (data_dir, fmt_money, fmt_pct, load_env, md_table, money, parse_date, read_json,  # noqa: E402
+                    reports_dir, today, write_json)
 
 TRAIN: bp.Window = (date(2014, 1, 1), date(2020, 12, 31))
 VALID: bp.Window = (date(2021, 1, 1), date(2022, 12, 31))
@@ -286,8 +289,185 @@ def main() -> None:
         advise_main(series)
 
 
-def advise_main(series) -> None:  # заменяется в Task 5
-    raise SystemExit("advise появится в следующей задаче")
+# ---------- советник ----------
+
+def signals(series, finalists: Dict[str, Any], holdout: Dict[str, Any]) -> Tuple[List[List[str]], Optional[Dict[str, float]], Optional[str]]:
+    """Текущий сигнал каждого финалиста TRAIN. Рекомендация — только у финалиста с вердиктом 1–2 на закрытом окне."""
+    view = View(series, series[CAL]["dates"][-1], br.UNIVERSE, CAL)
+    verd = {(r["family"], json.dumps(r["params"], sort_keys=True)): r["verdict"] for r in (holdout or {}).get("results", [])}
+    rows: List[List[str]] = []
+    best: Optional[Tuple[int, Dict[str, float], str]] = None
+    for fam, info in (finalists or {}).items():
+        if fam not in br.FAMILIES:
+            continue
+        w = br.FAMILIES[fam]["fn"](view, info["params"], {}) or {}
+        full = {b: w.get(b, 0.0) for b in br.BUCKETS}
+        full["LQDT"] = max(0.0, 1.0 - sum(full.values()))
+        v = verd.get((fam, json.dumps(info["params"], sort_keys=True)))
+        label = "рекомендация" if v is not None and v <= 2 else "справочно, не проверено"
+        name = f"{fam} {_pstr(info['params'])}"
+        rows.append([name, "да" if info.get("passed") else "нет", "—" if v is None else str(v), label,
+                     ", ".join(f"{b} {x:.0%}" for b, x in full.items() if x > 0)])
+        if label == "рекомендация" and (best is None or v < best[0]):
+            best = (v, full, name)
+    return rows, (best[1] if best else None), (best[2] if best else None)
+
+
+def market_section(series, zcyc_now: Optional[Tuple[Optional[str], Dict[float, float]]] = None) -> str:
+    kr = series["KEYRATE"]
+    r, d_kr = kr["close"][-1], kr["dates"][-1]
+    rows = [["Ключевая ставка", fmt_pct(r, 2), str(d_kr)],
+            [f"Доходность LQDT (оценка: ставка − {SAFE_SPREAD * 100:.1f} п.п.)", fmt_pct(r - SAFE_SPREAD, 2), str(d_kr)]]
+    if zcyc_now and zcyc_now[0]:
+        zd, pts = zcyc_now[0], {int(t): zcyc_now[1][t] for t in mi.ZCYC_TERMS if t in zcyc_now[1]}
+    else:
+        zd = str(series["ZCYC1"]["dates"][-1])
+        pts = {int(t): series[mi.ZCYC_TICKERS[t]]["close"][-1] for t in mi.ZCYC_TERMS}
+    for t, y in pts.items():
+        rows.append([f"КБД {t} г.", fmt_pct(y, 2), str(zd)])
+    if 1 in pts and 10 in pts:
+        rows.append(["Наклон КБД: 10 лет − 1 год", f"{(pts[10] - pts[1]) * 100:+.2f} п.п.", str(zd)])
+    for b in ["RGBITR"] + list(mi.BUCKETS):
+        s = series[b]
+        dur = s["duration"][-1]
+        rows.append([f"{b}: дюрация / доходность", f"{'—' if dur is None else f'{dur:.1f} г.'} / {fmt_pct(s['yield'][-1], 2)}",
+                     str(s["dates"][-1])])
+    return md_table(["Показатель", "Значение", "На дату"], rows)
+
+
+def advise_report(series, finalists: Dict[str, Any], holdout: Dict[str, Any], held: List[Dict[str, Any]],
+                  cand_rows: Optional[List[Dict[str, Any]]], warns: List[str], cfg_groups: Optional[List[Dict[str, Any]]],
+                  zcyc_now: Optional[Tuple[Optional[str], Dict[float, float]]] = None) -> Tuple[str, Dict[str, Any]]:
+    t0 = series[CAL]["dates"][-1]
+    sig_rows, rec, rec_name = signals(series, finalists, holdout)
+    out = [f"# Облигации: советник ({today()})", "", "## Рынок сейчас", market_section(series, zcyc_now), "", "### Сигналы правил",
+           md_table(["Правило", "Прошло VALID", "Вердикт HOLDOUT", "Статус", "Деление облигационной части"], sig_rows)
+           if sig_rows else "Финалистов нет — запусти `bond_research.py train`.", ""]
+    maturing: Dict[str, str] = {}
+    hold_zero: Dict[str, List[str]] = {ba.GROUP_FIXED: [], ba.GROUP_SHORT: []}
+    out.append("## Ваши облигации")
+    if held:
+        rows = []
+        for h in sorted(held, key=lambda x: -(x["value_rub"] or 0)):
+            b = ba.bucket_of(h["duration_mod"], h["floater"])
+            ends = [d for d in (h["maturity"], h["call"]) if d]
+            end = min(ends) if ends else None
+            if end is not None and (end - t0).days <= ba.MATURING_DAYS:
+                maturing[h["ticker"]] = b or "OFZ1Y"
+            # гасящийся выпуск тоже остаётся в группе с весом 0: deploy не должен считать его «чужим» и не докупает
+            hold_zero[ba.GROUP_FIXED if h["ofz"] and not h["floater"] else ba.GROUP_SHORT].append(h["ticker"])
+            rows.append([h["ticker"], (h["name"] or "")[:30], fmt_money(h["value_rub"]),
+                         "флоатер" if h["floater"] else fmt_pct(h["ytm"]),
+                         "—" if h["duration_mod"] is None else f"{h['duration_mod']:.1f}", ba.BUCKET_RU.get(b or "", "—"),
+                         str(end) if end else "—"])
+        out += [md_table(["Выпуск", "Название", "Оценка", "Доходность к погашению", "Дюрация, лет", "Корзина", "Погашение/оферта"], rows), "",
+                "Гасятся или оферта в ближайшие 12 месяцев: " + (", ".join(maturing) or "нет"), ""]
+    else:
+        out += ["Нет выгрузки портфеля — запусти `fetch.py`.", ""]
+    by, fl = ba.pick(cand_rows) if cand_rows else ({}, [])
+    out.append("## Кандидаты по корзинам")
+    if cand_rows is None:
+        out += ["Нет доступа к API — кандидаты не подобраны.", ""]
+    else:
+        out.append(f"ОФЗ без амортизации, оборот не меньше {fmt_money(ba.MIN_TURNOVER)} в день (среднее за {ba.TURNOVER_DAYS} дней), "
+                   f"топ-{ba.TOP_N} по доходности к погашению.")
+        for b in br.BUCKETS:
+            out += ["", f"### {b} ({ba.BUCKET_RU[b]})",
+                    md_table(["Выпуск", "Доходность к погашению", "Дюрация, лет", "Погашение", "Оборот/день"],
+                             [[r["ticker"], fmt_pct(r["ytm"], 2), f"{r['duration']:.1f}", str(r["maturity"]), fmt_money(r["turnover"])]
+                              for r in by.get(b, [])]) if by.get(b) else "Ликвидных выпусков нет."]
+        out += ["", "### Флоатеры",
+                md_table(["Выпуск", "Ближайший купон", "Погашение", "Оборот/день"],
+                         [[r["ticker"], f"{r['next_coupon'][0]}: {fmt_money(r['next_coupon'][1], digits=2)}" if r.get("next_coupon") else "—",
+                           str(r["maturity"]), fmt_money(r["turnover"])] for r in fl]) if fl else "Ликвидных флоатеров нет.", ""]
+    repl = {b: v[0]["ticker"] for b, v in by.items() if v}
+    if fl:
+        repl["OFZ1Y"] = fl[0]["ticker"]
+    if rec:
+        sleeve = (ba.current_weights(cfg_groups)[1] if cfg_groups else 0.0) or 50.0
+        buy = {b: [r["ticker"] for r in by.get(b, [])[:2]] for b in ("OFZ3Y", "OFZ5Y", "OFZ10Y")}
+        buy["OFZ1Y"] = [repl["OFZ1Y"]] if repl.get("OFZ1Y") else []
+        groups = ba.fragment_groups(rec, sleeve, buy, hold_zero)
+        notes = [f"Деление по правилу {rec_name}; облигационная часть {sleeve:g}% портфеля."]
+        notes += [f"Корзина {b}: нет ликвидного выпуска — её доля останется деньгами при deploy." for b, x in rec.items()
+                  if x > 0 and b != "LQDT" and not buy.get(b)]
+    elif cfg_groups:
+        groups, notes = ba.replace_maturing(cfg_groups, maturing, repl)
+        notes.insert(0, "Проверенного правила нет — текущая структура targets.yaml, гасящиеся выпуски заменены.")
+    else:
+        groups, notes = [], ["Нет ~/.tinvest/targets.yaml — фрагмент не построен."]
+    out += ["## Фрагмент targets.yaml"] + [f"- {n}" for n in notes] + ["", "```yaml", ba.render_groups(groups).rstrip(), "```", "",
+            "Замени этими группами одноимённые в ~/.tinvest/targets.yaml; акции и золото не трогай. Файл советник не меняет."]
+    if warns:
+        out += ["", "## Предупреждения"] + [f"- {w}" for w in warns]
+    return "\n".join(out) + "\n", {"weights": rec, "groups": groups}
+
+
+def held_bonds() -> List[Dict[str, Any]]:
+    """Облигации всех выгруженных счетов (данные fetch.py, без запросов к API)."""
+    import bonds
+    from model import Store
+    store = Store(data_dir())
+    out = []
+    for acc in store.account_ids():
+        for p in store.valued_positions(acc):
+            if p["type"] == "bond" and (p["value_rub"] or 0) > 0:
+                out.append(bonds.analyze_bond(store, acc, p))
+    return out
+
+
+def collect_candidates(api, t0: date) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """ОФЗ-кандидаты: справочник, последние цены, свечи за 40 дней (оборот), купоны до погашения (доходность)."""
+    rows, warns = [], []
+    found = [b for b in api.list_bonds() if ba.is_candidate(b, t0)]
+    prices = api.get_last_prices([b["uid"] for b in found])
+    for b in found:
+        uid, mat, nominal = b["uid"], parse_date(b["maturityDate"]), money(b.get("nominal"))
+        lp = prices.get(uid)
+        if not lp or nominal <= 0:
+            warns.append(f"{b['ticker']}: нет цены или номинала — пропущен")
+            continue
+        turnover = ba.turnover_rub(api.get_day_candles(uid, t0 - timedelta(days=40), t0), nominal, int(b.get("lot") or 1))
+        if turnover < ba.MIN_TURNOVER:
+            continue
+        cps = [(parse_date(c.get("couponDate")), money(c.get("payOneBond"))) for c in api.get_bond_coupons(uid, b.get("figi"), t0, mat)]
+        cps = sorted((d, a) for d, a in cps if d and d > t0)
+        floater = bool(b.get("floatingCouponFlag"))
+        row = {"ticker": b["ticker"], "name": b.get("name") or b["ticker"], "floater": floater, "maturity": mat,
+               "turnover": turnover, "ytm": None, "duration": None, "next_coupon": cps[0] if cps else None}
+        if not floater:
+            if not cps:
+                warns.append(f"{b['ticker']}: нет купонов в API — пропущен")
+                continue
+            row["ytm"], row["duration"] = ba.bond_metrics(lp / 100.0 * nominal + money(b.get("aciValue")), nominal, cps, mat, t0)
+        rows.append(row)
+    return rows, warns
+
+
+def advise_main(series) -> None:
+    from common import home
+    from deploy import load_targets
+    from tinvest_api import TInvestError, client_from_env
+    warns: List[str] = []
+    cand: Optional[List[Dict[str, Any]]] = None
+    try:
+        cand, w = collect_candidates(client_from_env(), today())
+        warns += w
+    except (ValueError, TInvestError) as e:
+        warns.append(f"нет доступа к API ({e}) — кандидаты не подобраны")
+    try:
+        zcyc_now = mi.fetch_zcyc(None)
+    except Exception as e:  # noqa: BLE001 — сеть: показываем последнюю точку из кэша
+        warns.append(f"КБД на сегодня не получена ({e}) — показана последняя из кэша")
+        zcyc_now = None
+    tp = home() / "targets.yaml"
+    cfg_groups = load_targets(tp)["groups"] if tp.exists() else None
+    text, _ = advise_report(series, read_json(finalists_path(), {}) or {}, read_json(holdout_result_path(), {}) or {},
+                            held_bonds(), cand, warns, cfg_groups, zcyc_now)
+    path = reports_dir() / "bonds_advise.md"
+    path.write_text(text, encoding="utf-8")
+    print(text)
+    print(f"Сохранено: {path}", file=sys.stderr)
 
 
 if __name__ == "__main__":

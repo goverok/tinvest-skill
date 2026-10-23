@@ -1055,6 +1055,67 @@ def test_bond_research():
     print("bond_research ok")
 
 
+def test_bond_advisor():
+    import yaml
+    import bond_advisor as ba
+    import bond_research as bres
+    from datetime import timedelta
+    t0 = date(2026, 1, 1)
+    assert [ba.bucket_of(x) for x in (0.5, 2.0, 5.0, 7.0)] == ["OFZ1Y", "OFZ3Y", "OFZ5Y", "OFZ10Y"]
+    assert ba.bucket_of(None) is None and ba.bucket_of(None, floater=True) == "OFZ1Y"
+    # бескупонная на год: цена 900 при номинале 1000 -> доходность 1000/900 − 1, модифицированная дюрация 1/(1+y)
+    y, dur = ba.bond_metrics(900.0, 1000.0, [], t0 + timedelta(days=365), t0)
+    assert close(y, 1000 / 900 - 1, 1e-6) and close(dur, 900 / 1000, 1e-6), (y, dur)
+    good = {"ticker": "SU26238RMFS4", "maturityDate": "2041-05-15T00:00:00Z", "currency": "rub"}
+    assert ba.is_candidate(good, t0)
+    for bad in (dict(good, ticker="RU000A10C6F7"), dict(good, amortizationFlag=True), dict(good, ticker="SU52005RMFS4"),
+                dict(good, maturityDate="2026-01-15T00:00:00Z"), dict(good, buyAvailableFlag=False), dict(good, currency="usd")):
+        assert not ba.is_candidate(bad, t0), bad
+    assert close(ba.turnover_rub([{"close": 100.0, "volume": 10}] * 25, 1000.0, 1), 10_000.0)
+    assert ba.turnover_rub([], 1000.0, 1) == 0.0
+    mat = date(2035, 1, 1)
+    rows = [{"ticker": "A", "floater": False, "ytm": 0.15, "duration": 6.0, "turnover": 2e7, "maturity": mat, "next_coupon": None},
+            {"ticker": "B", "floater": False, "ytm": 0.16, "duration": 7.0, "turnover": 2e7, "maturity": mat, "next_coupon": None},
+            {"ticker": "C", "floater": False, "ytm": 0.20, "duration": 7.0, "turnover": 1e6, "maturity": mat, "next_coupon": None},  # неликвид
+            {"ticker": "D", "floater": True, "ytm": None, "duration": None, "turnover": 5e7, "maturity": mat,
+             "next_coupon": (date(2026, 2, 1), 40.0)}]
+    by, fl = ba.pick(rows)
+    assert [r["ticker"] for r in by["OFZ10Y"]] == ["B", "A"] and [r["ticker"] for r in fl] == ["D"]
+    groups = ba.fragment_groups({"LQDT": 0.2, "OFZ10Y": 0.5, "OFZ1Y": 0.3}, 50.0, {"OFZ10Y": ["B", "A"], "OFZ1Y": ["D"]},
+                                {ba.GROUP_FIXED: ["SU26207RMFS9"]})
+    cfg = yaml.safe_load(ba.render_groups(groups))
+    g = {x["name"]: x for x in cfg["groups"]}
+    assert close(sum(x["weight"] for x in cfg["groups"]), 50.0, 0.2)
+    assert close(g[ba.GROUP_FIXED]["weight"], 25.0) and close(g[ba.GROUP_SHORT]["weight"], 15.0) and close(g[ba.GROUP_CASH]["weight"], 10.0)
+    assert close(sum(i["weight"] for i in g[ba.GROUP_FIXED]["items"]), 100.0, 0.2)
+    assert {"ticker": "SU26207RMFS9", "weight": 0} in g[ba.GROUP_FIXED]["items"]
+    # текущая структура и замена гасящегося выпуска
+    cur_groups = [{"name": "Акции РФ", "weight": 40.0, "items": [{"ticker": "TMOS@", "weight": 100.0}]},
+                  {"name": ba.GROUP_FIXED, "weight": 35.0, "items": [{"ticker": "X", "weight": 100.0}]},
+                  {"name": ba.GROUP_SHORT, "weight": 10.0, "items": [{"ticker": "F", "weight": 100.0}]},
+                  {"name": ba.GROUP_CASH, "weight": 5.0, "items": [{"ticker": "LQDT", "weight": 100.0}]}]
+    w, sleeve = ba.current_weights(cur_groups)
+    assert close(sleeve, 50.0) and close(w["OFZ10Y"], 0.7) and close(w["OFZ1Y"], 0.2) and close(w["LQDT"], 0.1), (w, sleeve)
+    new, notes = ba.replace_maturing(cur_groups, {"F": "OFZ1Y"}, {"OFZ1Y": "D"})
+    short = [x for x in new if x["name"] == ba.GROUP_SHORT][0]
+    assert {i["ticker"]: i["weight"] for i in short["items"]} == {"F": 0.0, "D": 100.0} and notes
+    assert all(x["name"] != "Акции РФ" for x in new)
+    # советник: сигнал финалиста с вердиктом 2 становится рекомендацией; без финалистов — текущая структура
+    s = _bond_series()
+    fin = {"curve": {"params": {"bucket": "OFZ10Y", "s": -0.01}, "passed": True}}
+    hold = {"results": [{"family": "curve", "params": {"bucket": "OFZ10Y", "s": -0.01}, "verdict": 2}]}
+    sig, rec, name = bres.signals(s, fin, hold)
+    assert rec is not None and close(sum(rec.values()), 1.0) and sig[0][3] == "рекомендация", (sig, rec)
+    held = [{"ticker": "F", "name": "Флоатер", "value_rub": 1000.0, "ytm": None, "duration_mod": 0.2, "floater": True,
+             "maturity": s["RGBITR"]["dates"][-1] + timedelta(days=100), "call": None, "ofz": True}]
+    text, out = bres.advise_report(s, {}, {}, held, rows, [], cur_groups)
+    assert "Фрагмент targets.yaml" in text and "D" in text and out["weights"] is None, text
+    text, out = bres.advise_report(s, fin, hold, held, rows, ["предупреждение"], cur_groups)
+    assert out["weights"] == rec and "предупреждение" in text
+    assert {"ticker": "F", "weight": 0} in [i for g2 in out["groups"] for i in g2["items"]], out["groups"]  # гасящийся — с весом 0
+    print("bond_advisor ok")
+
+
 if __name__ == "__main__":
     test_xirr()
     test_ytm_duration()
@@ -1073,4 +1134,5 @@ if __name__ == "__main__":
     test_bond_series()
     test_bond_rules()
     test_bond_research()
+    test_bond_advisor()
     print("ALL OK")
