@@ -148,10 +148,13 @@ def replace_maturing(groups: Sequence[Dict[str, Any]], maturing: Dict[str, str],
     for g in groups:
         if g["name"] not in GROUP_TO_BUCKET:
             continue
+        elsewhere = {i["ticker"] for g2 in groups if g2 is not g for i in g2["items"]}  # тикер не должен быть в двух группах
         items: Dict[str, float] = {}
         for it in g["items"]:
             t, w = it["ticker"], float(it["weight"])
             new = repl.get(maturing.get(t, ""))
+            if new in elsewhere:
+                new = None
             if t in maturing and w > 0 and new:
                 items[t] = 0.0
                 items[new] = items.get(new, 0.0) + w

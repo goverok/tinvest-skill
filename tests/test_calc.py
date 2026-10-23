@@ -1113,6 +1113,10 @@ def test_bond_advisor():
     short = [x for x in new if x["name"] == ba.GROUP_SHORT][0]
     assert {i["ticker"]: i["weight"] for i in short["items"]} == {"F": 0.0, "D": 100.0} and notes
     assert all(x["name"] != "Акции РФ" for x in new)
+    dup = [dict(g_, items=list(g_["items"])) for g_ in cur_groups]
+    dup[1]["items"].append({"ticker": "D", "weight": 0.0})  # D уже в другой группе — туда замену не ставим
+    new2, _ = ba.replace_maturing(dup, {"F": "OFZ1Y"}, {"OFZ1Y": "D"})
+    assert "D" not in [i["ticker"] for i in [x for x in new2 if x["name"] == ba.GROUP_SHORT][0]["items"]]
     # советник: сигнал финалиста с вердиктом 2 становится рекомендацией; без финалистов — текущая структура
     s = _bond_series()
     fin = {"curve": {"params": {"bucket": "OFZ10Y", "s": -0.01}, "passed": True}}
@@ -1156,8 +1160,8 @@ def test_bond_advisor():
     assert sorted(cd) == ["SU1", "SU4"], sorted(cd)
     assert close(cd["SU1"]["turnover"], 100000 * 2 * 1000.0), cd["SU1"]  # лоты × лот × цена(% номинала) × номинал
     y1, d1 = ba.bond_metrics(1000.0 + 10.5, 1000.0, [(date(2026, 7, 1), 50.0), (date(2027, 1, 1), 50.0)], date(2040, 1, 1), date(2026, 1, 2))
-    assert cd["SU1"]["ytm"] is not None and cd["SU4"]["ytm"] is None and cd["SU4"]["floater"]
-    assert y1 is not None
+    assert close(cd["SU1"]["ytm"], y1, 1e-9) and close(cd["SU1"]["duration"], d1, 1e-9), (cd["SU1"], y1, d1)
+    assert cd["SU4"]["ytm"] is None and cd["SU4"]["floater"]
     wtext = " ".join(cwarn)
     assert "SU2" in wtext and "SU3" in wtext and "SU5" in wtext and "SU6" not in wtext and "RU7" not in wtext, cwarn
     # advise_main без токена: блоки 1 и 4 есть, кандидаты пропущены с пометкой
