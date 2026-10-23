@@ -320,6 +320,63 @@ def test_bond_series():
     print("bond_series ok")
 
 
+def test_bond_rules():
+    import bond_rules as br
+    import moex_iss as mi
+    from bt_sim import View
+    from bt_strategies import grid_variants
+    from datetime import timedelta
+    d0 = date(2020, 1, 1)
+    days = [d0 + timedelta(days=i) for i in range(400)]
+
+    def lvl(t, vals, ds=None):
+        return mi._series(t, ds or days, vals)
+
+    base = {"RGBITR": lvl("RGBITR", [100.0] * 400), "LQDT": lvl("LQDT", [1.0003 ** i for i in range(400)])}
+    for b in br.BUCKETS:
+        base[b] = lvl(b, [100.0] * 400)
+    last = days[-1]
+    # curve: ставка 10% -> LQDT 9.5%; КБД 10 лет 12% -> спред 2.5 п.п. > 2 п.п.
+    s = dict(base, KEYRATE=lvl("KEYRATE", [0.10] * 400), ZCYC10=lvl("ZCYC10", [0.12], [days[100]]))
+    assert br.curve(View(s, last, br.UNIVERSE, "RGBITR"), {"bucket": "OFZ10Y", "s": 0.02}, {}) == {"OFZ10Y": 1.0}
+    s["ZCYC10"] = lvl("ZCYC10", [0.11], [days[100]])                     # спред 1.5 п.п.
+    assert br.curve(View(s, last, br.UNIVERSE, "RGBITR"), {"bucket": "OFZ10Y", "s": 0.02}, {}) == {}
+    s["ZCYC10"] = lvl("ZCYC10", [0.11, 0.30], [days[100], days[399]])   # будущая точка не видна
+    assert br.curve(View(s, days[398], br.UNIVERSE, "RGBITR"), {"bucket": "OFZ10Y", "s": 0.02}, {}) == {}
+    assert br.curve(View(dict(base, KEYRATE=s["KEYRATE"]), last, br.UNIVERSE, "RGBITR"), {"bucket": "OFZ3Y", "s": 0.0}, {}) == {}
+    # rate_cycle: 16% до дня 300, потом 14%
+    kr = lvl("KEYRATE", [0.16 if i < 300 else 0.14 for i in range(400)])
+    v = View(dict(base, KEYRATE=kr), last, br.UNIVERSE, "RGBITR")
+    assert br.rate_cycle(v, {"M": 6, "d": 0.01, "bucket": "OFZ10Y"}, {}) == {"OFZ10Y": 1.0}
+    assert br.rate_cycle(v, {"M": 6, "d": 0.03, "bucket": "OFZ10Y"}, {}) == {}
+    kr_old = lvl("KEYRATE", [0.16 if i < 100 else 0.14 for i in range(400)])   # снижение 300 дней назад
+    v2 = View(dict(base, KEYRATE=kr_old), last, br.UNIVERSE, "RGBITR")
+    assert br.rate_cycle(v2, {"M": 6, "d": 0.005, "bucket": "OFZ5Y"}, {}) == {}
+    assert br.rate_cycle(v2, {"M": 12, "d": 0.005, "bucket": "OFZ5Y"}, {}) == {"OFZ5Y": 1.0}
+    assert br.rate_cycle(v2, {"M": 6, "d": 0.0, "bucket": "OFZ5Y"}, {}) == {"OFZ5Y": 1.0}   # d=0 — держать всегда
+    # ts_momentum: OFZ10Y быстрее LQDT, OFZ5Y падает, OFZ1Y/3Y стоят
+    s = dict(base, KEYRATE=kr)
+    s["OFZ10Y"] = lvl("OFZ10Y", [100.0 * 1.001 ** i for i in range(400)])
+    s["OFZ5Y"] = lvl("OFZ5Y", [100.0 * 0.999 ** i for i in range(400)])
+    v = View(s, last, br.UNIVERSE, "RGBITR")
+    assert br.ts_momentum(v, {"L": 3, "set": "all"}, {}) == {"OFZ10Y": 1.0}
+    assert br.ts_momentum(v, {"L": 3, "set": "long"}, {}) == {"OFZ10Y": 1.0}
+    s["OFZ10Y"] = s["OFZ5Y"]
+    assert br.ts_momentum(View(s, last, br.UNIVERSE, "RGBITR"), {"L": 6, "set": "long"}, {}) == {}
+    assert br.ts_momentum(View(s, days[30], br.UNIVERSE, "RGBITR"), {"L": 12, "set": "all"}, {}) == {}   # мало истории
+    # бенчмарки и случайный контроль
+    fn, p = br.BENCHMARKS[br.CURRENT_NAME]
+    w = fn(v, p, {})
+    assert close(w["OFZ10Y"], 7 / 9) and close(w["OFZ1Y"], 2 / 9) and sum(w.values()) <= 1 + 1e-9
+    assert br.BENCHMARKS["LQDT"][0](v, br.BENCHMARKS["LQDT"][1], {}) == {}
+    assert br.BENCHMARKS["RGBITR"][0](v, br.BENCHMARKS["RGBITR"][1], {}) == {"RGBITR": 1.0}
+    r1 = br.random_bucket(v, {"seed": 3}, {})
+    assert r1 == br.random_bucket(v, {"seed": 3}, {}) and sum(r1.values()) <= 1.0
+    assert [len(grid_variants(f["grid"])) for f in br.FAMILIES.values()] == [12, 12, 6]
+    assert all(f["rebalance"] == "monthly" for f in br.FAMILIES.values())
+    print("bond_rules ok")
+
+
 def test_backtest():
     from backtest import align_states, max_drawdown, simulate, trend_states
     # SMA(3): прогрев -> None; 10 = SMA -> не выше -> вне рынка; 13 > 11 -> в рынке; 7 < 10 -> вне
@@ -960,4 +1017,5 @@ if __name__ == "__main__":
     test_research_report()
     test_moex_iss()
     test_bond_series()
+    test_bond_rules()
     print("ALL OK")
