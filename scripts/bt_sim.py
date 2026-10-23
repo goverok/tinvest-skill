@@ -35,10 +35,11 @@ Result = Dict[str, Any]
 class View:
     """Срез всех серий до даты today включительно."""
 
-    def __init__(self, series: Dict[str, Series], today: date, universe: Sequence[str]):
+    def __init__(self, series: Dict[str, Series], today: date, universe: Sequence[str], calendar: str = "IMOEX"):
         self._s = series
         self.today = today
         self.universe = list(universe)
+        self.calendar = calendar
         self._end: Dict[str, int] = {}
 
     def _e(self, t: str) -> int:
@@ -69,10 +70,19 @@ class View:
             raise IndexError(f"{t}: нет бара со смещением {offset} на {self.today}")
         return self._s[t][field][i]
 
+    def asof(self, t: str, field: str, d: date) -> Optional[float]:
+        """Значение поля на последнем баре не позже min(d, today); None — тикера или бара нет. Для рядов-уровней
+        (КБД, ключевая ставка), у которых свой календарь."""
+        s = self._s.get(t)
+        if s is None:
+            return None
+        i = bisect.bisect_right(s["dates"], min(d, self.today)) - 1
+        return s[field][i] if i >= 0 else None
+
     def bars_until(self, d: date) -> int:
-        """Сколько баров календаря IMOEX строго после today и не позже d. Биржевой календарь известен заранее —
+        """Сколько баров торгового календаря строго после today и не позже d. Биржевой календарь известен заранее —
         единственное, что View знает о будущем."""
-        cal = self._s["IMOEX"]["dates"]
+        cal = self._s[self.calendar]["dates"]
         return bisect.bisect_right(cal, d) - bisect.bisect_right(cal, self.today)
 
     def upcoming_dividends(self, t: str) -> List[Dict[str, Any]]:
@@ -103,11 +113,11 @@ def _close_before(s: Series, d: date) -> Optional[float]:
 def simulate(series: Dict[str, Series], strategy: Strategy, params: dict, *, start: date, end: date,
              universe: Optional[Sequence[str]] = None, capital: float = 1_000_000.0, cost: float = COST,
              slip: float = SLIP, tax_rate: Optional[float] = None, rebalance_threshold: float = REBALANCE_THRESHOLD,
-             fill: str = "open", rebalance: str = "daily", safe: str = "LQDT") -> Result:
-    cal = [d for d in series["IMOEX"]["dates"] if start <= d <= end]
+             fill: str = "open", rebalance: str = "daily", safe: str = "LQDT", calendar: str = "IMOEX") -> Result:
+    cal = [d for d in series[calendar]["dates"] if start <= d <= end]
     if not cal:
-        raise ValueError("пустой календарь: нет свечей IMOEX в окне")
-    default_uni = [t for t in series if t not in ("IMOEX", safe, "TMOS")]
+        raise ValueError(f"пустой календарь: нет свечей {calendar} в окне")
+    default_uni = [t for t in series if t not in ("IMOEX", calendar, safe, "TMOS")]
     uni = [t for t in (universe if universe is not None else default_uni) if t in series]  # [] — пустая вселенная, не «все»
     tradable = uni + [safe]
     cash = capital
@@ -253,7 +263,7 @@ def simulate(series: Dict[str, Series], strategy: Strategy, params: dict, *, sta
         is_last = i == len(cal) - 1
         month_end = is_last or cal[i + 1].month != d.month
         if rebalance == "daily" or month_end:
-            view = View(series, d, uni)
+            view = View(series, d, uni, calendar)
             target = strategy(view, params, state) or {}
             if sum(target.values()) > 1.0 + 1e-9:
                 raise ValueError(f"сумма весов {sum(target.values()):.3f} > 1 на {d}")

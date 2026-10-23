@@ -287,6 +287,39 @@ def test_moex_iss():
     print("moex_iss ok")
 
 
+def test_bond_series():
+    import moex_iss as mi
+    from bt_sim import View, simulate
+    from datetime import timedelta
+    d0 = date(2020, 1, 1)
+    days = [d0 + timedelta(days=i) for i in range(40)]
+    raw = {"indices": {ix: [{"date": d.isoformat(), "close": 100.0 + i * (k + 1), "duration": 100.0 * (k + 1), "yield": 0.06}
+                            for i, d in enumerate(days)] for k, ix in enumerate(mi.INDICES)},
+           "zcyc": {"2020-01-31": {1.0: 0.05, 3.0: 0.055, 5.0: 0.06, 10.0: 0.065}},
+           "key_rate": [("2020-01-01", 0.0625), ("2020-01-20", 0.06)]}
+    lq = mi._series("LQDT", days, [1.0 + i * 0.001 for i in range(40)])
+    s = mi.build_series(raw, lq)
+    assert set(s) >= {"RGBITR", "OFZ1Y", "OFZ10Y", "ZCYC1", "ZCYC10", "KEYRATE", "LQDT"}, set(s)
+    assert close(s["OFZ10Y"]["duration"][0], 500.0 / 365.0) and close(s["OFZ10Y"]["yield"][0], 0.06)
+    med = mi.bucket_durations(s)
+    assert med["OFZ1Y"][0] < med["OFZ3Y"][0] < med["OFZ5Y"][0] < med["OFZ10Y"][0], med
+    v = View(s, date(2020, 1, 25), ["OFZ1Y"], "RGBITR")
+    assert v.asof("ZCYC10", "close", date(2020, 2, 28)) is None            # КБД за 31.01 на 25.01 ещё неизвестна
+    assert close(v.asof("KEYRATE", "close", date(2020, 1, 25)), 0.06) and close(v.asof("KEYRATE", "close", date(2020, 1, 10)), 0.0625)
+    assert v.asof("NOPE", "close", date(2020, 1, 25)) is None
+    assert v.bars_until(date(2020, 1, 27)) == 2
+    # календарь RGBITR и IMOEX на одинаковых датах дают один и тот же результат
+    s2 = dict(s, IMOEX=s["RGBITR"])
+
+    def half(view, p, st):
+        return {"OFZ5Y": 0.5}
+
+    a = simulate(s2, half, {}, start=d0, end=days[-1], universe=["OFZ5Y"], calendar="RGBITR", rebalance="monthly")
+    b = simulate(s2, half, {}, start=d0, end=days[-1], universe=["OFZ5Y"], rebalance="monthly")
+    assert close(a["final"], b["final"]) and a["trades"] == b["trades"] and a["trades"], (a["final"], b["final"])
+    print("bond_series ok")
+
+
 def test_backtest():
     from backtest import align_states, max_drawdown, simulate, trend_states
     # SMA(3): прогрев -> None; 10 = SMA -> не выше -> вне рынка; 13 > 11 -> в рынке; 7 < 10 -> вне
@@ -926,4 +959,5 @@ if __name__ == "__main__":
     test_bt_protocol()
     test_research_report()
     test_moex_iss()
+    test_bond_series()
     print("ALL OK")

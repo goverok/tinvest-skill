@@ -206,3 +206,46 @@ def load(refresh: bool = False) -> Dict[str, Any]:
     indices = _load_indices(bd, refresh, stale_before)
     zcyc = _load_zcyc(bd, refresh, [r["date"] for r in indices["RGBITR"]])
     return {"indices": indices, "zcyc": zcyc, "key_rate": _load_key_rate(bd, refresh, stale_before)}
+
+
+# ---------- серии для симулятора ----------
+
+BUCKETS = {"OFZ1Y": "RUGBITR1Y", "OFZ3Y": "RUGBITR3Y", "OFZ5Y": "RUGBITR5Y", "OFZ10Y": "RUGBITR10Y"}
+ZCYC_TICKERS = {1.0: "ZCYC1", 3.0: "ZCYC3", 5.0: "ZCYC5", 10.0: "ZCYC10"}
+
+
+def _series(ticker: str, dates: Sequence[date], values: Sequence[float], extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Серия формата bt_data.Series из одного ряда значений (open = high = low = close = tr), лот 1."""
+    v = [float(x) for x in values]
+    s = {"ticker": ticker, "lot": 1, "dates": list(dates), "open": list(v), "high": list(v), "low": list(v), "close": list(v),
+         "volume": [0.0] * len(v), "tr": list(v), "divs": [], "warnings": []}
+    s.update(extra or {})
+    return s
+
+
+def build_series(raw: Dict[str, Any], lqdt: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Сырые данные load() + серия LQDT -> серии симулятора: индексы (с полями duration в годах и yield),
+    уровни КБД ZCYC1…ZCYC10 и KEYRATE (close = доходность/ставка долей), LQDT."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for name, ix in [("RGBITR", "RGBITR")] + list(BUCKETS.items()):
+        rows = raw["indices"][ix]
+        out[name] = _series(name, [date.fromisoformat(r["date"]) for r in rows], [r["close"] for r in rows],
+                            {"duration": [r["duration"] / 365.0 if r.get("duration") is not None else None for r in rows],
+                             "yield": [r.get("yield") for r in rows]})
+    zd = sorted(raw["zcyc"])
+    for term, t in ZCYC_TICKERS.items():
+        pts = [(date.fromisoformat(d), raw["zcyc"][d][term]) for d in zd if term in raw["zcyc"][d]]
+        out[t] = _series(t, [p[0] for p in pts], [p[1] for p in pts])
+    kr = raw["key_rate"]
+    out["KEYRATE"] = _series("KEYRATE", [date.fromisoformat(d) for d, _ in kr], [r for _, r in kr])
+    out["LQDT"] = lqdt
+    return out
+
+
+def bucket_durations(series: Dict[str, Dict[str, Any]]) -> Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]]:
+    """Медиана, минимум, максимум дюрации (лет) каждой корзины — проверка, что корзины упорядочены по сроку."""
+    out = {}
+    for b in BUCKETS:
+        v = sorted(x for x in series[b]["duration"] if x is not None)
+        out[b] = (v[len(v) // 2], v[0], v[-1]) if v else (None, None, None)
+    return out
