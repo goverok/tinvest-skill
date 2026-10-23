@@ -24,6 +24,7 @@ HISTORY_FROM = date(2013, 1, 1)
 ZCYC_FROM = "2013-12-01"
 KEY_RATE_FROM = date(2013, 9, 13)  # первая ключевая ставка ЦБ
 STALE_DAYS = 3
+ZCYC_RETRY_DAYS = 7  # пустую КБД за последние дни не запоминаем: данные могут появиться позже
 TIMEOUT = 40
 
 
@@ -98,7 +99,7 @@ def fetch_index(ix: str, d_from: date) -> List[Dict[str, Any]]:
                       {"from": d_from.isoformat(), "history.columns": "TRADEDATE,CLOSE,DURATION,YIELD", "start": start})
         page, start, total = parse_index_page(j)
         rows += page
-        if not page or start >= total:
+        if not (j.get("history") or {}).get("data") or start >= total:
             return rows
 
 
@@ -122,52 +123,86 @@ def fetch_key_rate(d_from: date, d_to: date) -> List[Tuple[str, float]]:
 
 # ---------- кэш ----------
 
-def load(refresh: bool = False) -> Dict[str, Any]:
-    """Сырые данные из кэша с докачкой хвоста. Сбой сети — предупреждение и кэш; пустой кэш при сбое — SystemExit."""
-    bd = bonds_dir()
-    stale_before = (today() - timedelta(days=STALE_DAYS)).isoformat()
-    out: Dict[str, Any] = {"indices": {}, "zcyc": {}, "key_rate": []}
+def _offline(what: str, err: Exception, last: Optional[str]) -> None:
+    warn(f"{what}: источник недоступен ({err}) — используется кэш, данные на {last}")
+
+
+def _load_indices(bd: Path, refresh: bool, stale_before: str) -> Dict[str, List[Dict[str, Any]]]:
+    out: Dict[str, List[Dict[str, Any]]] = {}
     for ix in INDICES:
         path = bd / f"{ix}.json"
-        cached = [] if refresh else (read_json(path, []) or [])
-        if not cached or cached[-1]["date"] < stale_before:
-            d_from = date.fromisoformat(cached[-1]["date"]) if cached else HISTORY_FROM
+        cached = read_json(path, []) or []
+        if refresh or not cached or cached[-1]["date"] < stale_before:
+            d_from = HISTORY_FROM if refresh or not cached else date.fromisoformat(cached[-1]["date"])
             try:
                 cached = merge_rows(cached, fetch_index(ix, d_from))
                 write_json(path, cached)
             except requests.RequestException as e:
-                warn(f"{ix}: ISS недоступен ({e}) — используется кэш")
+                if not cached:
+                    raise SystemExit(f"Нет данных индекса {ix}: ISS недоступен ({e}), кэша нет")
+                _offline(f"Индекс {ix}", e, cached[-1]["date"])
         if not cached:
-            raise SystemExit(f"Нет данных индекса {ix}: ISS недоступен, кэша нет")
-        out["indices"][ix] = cached
+            raise SystemExit(f"Нет данных индекса {ix}: ISS вернул пустой ответ, кэша нет")
+        out[ix] = cached
+    return out
 
+
+def _load_zcyc(bd: Path, refresh: bool, index_dates: Sequence[str]) -> Dict[float, Dict[float, float]]:
     zpath = bd / "zcyc.json"
-    z: Dict[str, Dict[str, float]] = {} if refresh else (read_json(zpath, {}) or {})
-    want = [d for d in month_ends([r["date"] for r in out["indices"]["RGBITR"]]) if d >= ZCYC_FROM]
+    cached: Dict[str, Dict[str, float]] = read_json(zpath, {}) or {}
+    z = dict(cached)
+    this_month = today().isoformat()[:7]
+    finished = [d for d in month_ends(index_dates) if d >= ZCYC_FROM and d[:7] < this_month]
+    recent = (today() - timedelta(days=ZCYC_RETRY_DAYS)).isoformat()
     try:
-        for d in (d for d in want if d not in z):
+        for d in (d for d in finished if refresh or d not in z):
             got, curve = fetch_zcyc(d)
-            z[d] = {str(k): v for k, v in curve.items()} if got == d else {}  # {} — КБД на дату нет, не перезапрашивать
+            if got == d:
+                z[d] = {str(k): v for k, v in curve.items()}
+            elif d < recent and d not in z:
+                z[d] = {}  # {} — КБД на дату нет, не перезапрашивать; свежие даты пробуем снова
         got, curve = fetch_zcyc(None)
         if got:
+            z = {d: c for d, c in z.items() if d in finished}  # прежняя «последняя» точка заменяется
             z[got] = {str(k): v for k, v in curve.items()}
     except requests.RequestException as e:
-        warn(f"КБД: ISS недоступен ({e}) — используется кэш")
-    write_json(zpath, z)
-    out["zcyc"] = {d: {float(k): v for k, v in c.items()} for d, c in sorted(z.items()) if c}
+        have = [d for d, c in z.items() if c]
+        if not have:
+            raise SystemExit(f"Нет данных КБД: ISS недоступен ({e}), кэша нет")
+        _offline("КБД", e, max(have))
+    if z != cached:
+        write_json(zpath, z)
+    out = {d: {float(k): v for k, v in c.items()} for d, c in sorted(z.items()) if c}
+    if not out:
+        raise SystemExit("Нет данных КБД: ISS вернул пустой ответ, кэша нет")
+    return out
 
+
+def _load_key_rate(bd: Path, refresh: bool, stale_before: str) -> List[Tuple[str, float]]:
     kpath = bd / "key_rate.json"
-    kr = [] if refresh else (read_json(kpath, []) or [])
-    if not kr or kr[-1][0] < stale_before:
-        d_from = date.fromisoformat(kr[-1][0]) if kr else KEY_RATE_FROM
+    kr = read_json(kpath, []) or []
+    if refresh or not kr or kr[-1][0] < stale_before:
+        d_from = KEY_RATE_FROM if refresh or not kr else date.fromisoformat(kr[-1][0])
         try:
             m = {d: r for d, r in kr}
             m.update(dict(fetch_key_rate(d_from, today())))
             kr = [[d, m[d]] for d in sorted(m)]
             write_json(kpath, kr)
         except requests.RequestException as e:
-            warn(f"Ключевая ставка: сервис ЦБ недоступен ({e}) — используется кэш")
+            if not kr:
+                raise SystemExit(f"Нет данных ключевой ставки: сервис ЦБ недоступен ({e}), кэша нет")
+            _offline("Ключевая ставка", e, kr[-1][0])
     if not kr:
-        raise SystemExit("Нет данных ключевой ставки: сервис ЦБ недоступен, кэша нет")
-    out["key_rate"] = [(d, r) for d, r in kr]
-    return out
+        raise SystemExit("Нет данных ключевой ставки: сервис ЦБ вернул пустой ответ, кэша нет")
+    return [(d, r) for d, r in kr]
+
+
+def load(refresh: bool = False) -> Dict[str, Any]:
+    """Сырые данные из кэша с докачкой хвоста. Сбой сети — предупреждение с датой последних данных и кэш;
+    пустой кэш при сбое — SystemExit. refresh=True перекачивает всё, но кэш не удаляет: файлы перезаписываются
+    только после успешной загрузки. Данные не старше STALE_DAYS считаются свежими (в сеть не ходим)."""
+    bd = bonds_dir()
+    stale_before = (today() - timedelta(days=STALE_DAYS)).isoformat()
+    indices = _load_indices(bd, refresh, stale_before)
+    zcyc = _load_zcyc(bd, refresh, [r["date"] for r in indices["RGBITR"]])
+    return {"indices": indices, "zcyc": zcyc, "key_rate": _load_key_rate(bd, refresh, stale_before)}

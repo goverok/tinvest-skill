@@ -183,33 +183,103 @@ def test_moex_iss():
     merged = mi.merge_rows([{"date": "2014-01-08", "close": 1.0}, {"date": "2014-01-09", "close": 2.0}],
                            [{"date": "2014-01-09", "close": 2.5}, {"date": "2014-01-10", "close": 3.0}])
     assert [r["close"] for r in merged] == [1.0, 2.5, 3.0]
-    # сеть недоступна: кэш используется, без кэша — SystemExit
+    # пагинация: страница из одних None-закрытий не обрывает загрузку, пустой сырой блок — обрывает
+    pages = {0: {"history": {"columns": ["TRADEDATE", "CLOSE", "DURATION", "YIELD"],
+                             "data": [["2014-01-08", None, 1, 1.0]]},
+                 "history.cursor": {"columns": ["INDEX", "TOTAL", "PAGESIZE"], "data": [[0, 150, 100]]}},
+             100: {"history": {"columns": ["TRADEDATE", "CLOSE", "DURATION", "YIELD"],
+                               "data": [["2014-01-09", 5.0, 1, 1.0]]},
+                   "history.cursor": {"columns": ["INDEX", "TOTAL", "PAGESIZE"], "data": [[100, 150, 100]]}}}
+    saved_get = mi._get_json
+    mi._get_json = lambda url, params: pages[params["start"]]
+    try:
+        assert [r["date"] for r in mi.fetch_index("RGBITR", date(2014, 1, 1))] == ["2014-01-09"]
+    finally:
+        mi._get_json = saved_get
+    # сеть недоступна: кэш используется (с датой в предупреждении), без кэша — SystemExit
     import requests
-    from common import write_json
+    import shutil
+    from common import read_json, write_json
     old_home = os.environ.get("TINVEST_HOME")
-    saved = (mi.fetch_index, mi.fetch_zcyc, mi.fetch_key_rate)
+    saved = (mi.fetch_index, mi.fetch_zcyc, mi.fetch_key_rate, mi.warn, mi.today)
+    warns = []
 
     def down(*a, **k):
         raise requests.ConnectionError("нет сети")
 
-    try:
+    def fresh_home():
         os.environ["TINVEST_HOME"] = tempfile.mkdtemp(prefix="tinvest-iss-")
+        warns.clear()
+        return mi.bonds_dir()
+
+    def seed(bd, idx_dates, zcyc, kr_date):
+        for ix in mi.INDICES:
+            write_json(bd / f"{ix}.json", [{"date": d, "close": 100.0, "duration": 100.0, "yield": 0.06} for d in idx_dates])
+        if zcyc is not None:
+            write_json(bd / "zcyc.json", zcyc)
+        write_json(bd / "key_rate.json", [[kr_date, 0.055]])
+
+    homes = []
+    try:
+        mi.warn = warns.append
+        mi.today = lambda: date(2014, 2, 5)
         mi.fetch_index = mi.fetch_zcyc = mi.fetch_key_rate = down
+        bd = fresh_home()
+        homes.append(os.environ["TINVEST_HOME"])
         try:
             mi.load()
             raise AssertionError("без кэша и сети должен быть SystemExit")
         except SystemExit:
             pass
-        bd = mi.bonds_dir()
-        for ix in mi.INDICES:
-            write_json(bd / f"{ix}.json", [{"date": "2014-01-31", "close": 100.0, "duration": 100.0, "yield": 0.06}])
-        write_json(bd / "zcyc.json", {"2014-01-31": {"1.0": 0.065, "10.0": 0.081}})
-        write_json(bd / "key_rate.json", [["2014-01-31", 0.055]])
+        seed(bd, ["2014-01-31"], {"2014-01-31": {"1.0": 0.065, "10.0": 0.081}}, "2014-01-31")
         raw = mi.load()
         assert raw["indices"]["RGBITR"][0]["close"] == 100.0 and raw["zcyc"]["2014-01-31"][10.0] == 0.081
         assert raw["key_rate"] == [("2014-01-31", 0.055)]
+        assert warns == [] or all("2014-01-31" in w for w in warns), warns  # кэш свежий (<= STALE_DAYS) — сети не касались
+        # кэш устарел: предупреждения содержат дату последних данных
+        mi.today = lambda: date(2014, 3, 20)
+        warns.clear()
+        raw = mi.load()
+        assert len(warns) == 7 and all("2014-01-31" in w for w in warns), warns
+        # refresh при упавшей сети кэш не трогает
+        before = {p.name: p.read_bytes() for p in bd.iterdir()}
+        warns.clear()
+        raw = mi.load(refresh=True)
+        assert {p.name: p.read_bytes() for p in bd.iterdir()} == before and raw["zcyc"]["2014-01-31"][1.0] == 0.065
+        assert warns and all("2014-01-31" in w for w in warns), warns
+        # нет кэша КБД при упавшей сети — SystemExit
+        bd = fresh_home()
+        homes.append(os.environ["TINVEST_HOME"])
+        seed(bd, ["2014-01-31"], None, "2014-01-31")
+        try:
+            mi.load()
+            raise AssertionError("без кэша КБД должен быть SystemExit")
+        except SystemExit as e:
+            assert "КБД" in str(e), e
+        # устаревшая «последняя» точка заменяется, концы завершённых месяцев остаются, пустая свежая КБД не пишется
+        mi.today = lambda: date(2026, 10, 3)
+        mi.fetch_index = lambda ix, d_from: []
+        mi.fetch_key_rate = lambda a, b: []
+        calls = []
+
+        def zc(d):
+            calls.append(d)
+            if d is None:
+                return "2026-10-02", {1.0: 0.15}
+            return (None, {}) if d == "2026-09-30" else (d, {1.0: 0.14})
+        mi.fetch_zcyc = zc
+        bd = fresh_home()
+        homes.append(os.environ["TINVEST_HOME"])
+        seed(bd, ["2026-08-31", "2026-09-30", "2026-10-02"], {"2026-08-31": {"1.0": 0.13}, "2026-09-25": {"1.0": 0.12}}, "2026-10-01")
+        raw = mi.load()
+        saved_z = read_json(bd / "zcyc.json", {})
+        assert sorted(saved_z) == ["2026-08-31", "2026-10-02"], saved_z  # 09-25 вытеснена, пустая 09-30 не записана
+        assert sorted(raw["zcyc"]) == ["2026-08-31", "2026-10-02"] and calls == ["2026-09-30", None], (raw["zcyc"], calls)
+        assert warns == [], warns
     finally:
-        mi.fetch_index, mi.fetch_zcyc, mi.fetch_key_rate = saved
+        mi.fetch_index, mi.fetch_zcyc, mi.fetch_key_rate, mi.warn, mi.today = saved
+        for h in homes:
+            shutil.rmtree(h, ignore_errors=True)
         if old_home is None:
             os.environ.pop("TINVEST_HOME", None)
         else:
