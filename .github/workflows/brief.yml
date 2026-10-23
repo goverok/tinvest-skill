@@ -2,8 +2,8 @@ name: tinvest brief
 
 on:
   schedule:
-    - cron: "45 5 * * 1-5"   # 08:45 МСК, будни — бриф
-    - cron: "30 15 * * 1-5"  # 18:30 МСК, будни — только алерты
+    - cron: "17 2 * * 1-5"   # 05:17 МСК (GitHub опаздывает на 4–5 ч), будни — бриф
+    - cron: "17 12 * * 1-5"  # 15:17 МСК (GitHub опаздывает на 4–5 ч), будни — только алерты
   workflow_dispatch:
     inputs:
       mode:
@@ -52,7 +52,7 @@ jobs:
         id: mode
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then m="${{ github.event.inputs.mode }}"
-          elif [ "${{ github.event.schedule }}" = "30 15 * * 1-5" ]; then m="alerts"
+          elif [ "${{ github.event.schedule }}" = "17 12 * * 1-5" ]; then m="alerts"
           else m="brief"; fi
           echo "mode=$m" >> "$GITHUB_OUTPUT"
 
