@@ -1066,13 +1066,18 @@ def test_bond_advisor():
     # бескупонная на год: цена 900 при номинале 1000 -> доходность 1000/900 − 1, модифицированная дюрация 1/(1+y)
     y, dur = ba.bond_metrics(900.0, 1000.0, [], t0 + timedelta(days=365), t0)
     assert close(y, 1000 / 900 - 1, 1e-6) and close(dur, 900 / 1000, 1e-6), (y, dur)
-    good = {"ticker": "SU26238RMFS4", "maturityDate": "2041-05-15T00:00:00Z", "currency": "rub"}
+    good = {"ticker": "SU26238RMFS4", "maturityDate": "2041-05-15T00:00:00Z", "currency": "rub",
+            "forIisFlag": True, "tradingStatus": "SECURITY_TRADING_STATUS_NORMAL_TRADING"}
     assert ba.is_candidate(good, t0)
+    assert ba.is_candidate({k: v for k, v in good.items() if k != "tradingStatus"}, t0)  # статус не указан — не проверяем
     for bad in (dict(good, ticker="RU000A10C6F7"), dict(good, amortizationFlag=True), dict(good, ticker="SU52005RMFS4"),
-                dict(good, maturityDate="2026-01-15T00:00:00Z"), dict(good, buyAvailableFlag=False), dict(good, currency="usd")):
+                dict(good, maturityDate="2026-01-15T00:00:00Z"), dict(good, buyAvailableFlag=False), dict(good, currency="usd"),
+                dict(good, forIisFlag=False), dict(good, tradingStatus="SECURITY_TRADING_STATUS_NOT_AVAILABLE_FOR_TRADING")):
         assert not ba.is_candidate(bad, t0), bad
     assert close(ba.turnover_rub([{"close": 100.0, "volume": 10}] * 25, 1000.0, 1), 10_000.0)
     assert ba.turnover_rub([], 1000.0, 1) == 0.0
+    part = [{"time": "2026-01-01T00:00:00Z", "close": 100.0, "volume": 10}, {"time": "2026-01-02T00:00:00Z", "close": 100.0, "volume": 1000}]
+    assert close(ba.turnover_rub(part, 1000.0, 1, today=date(2026, 1, 2)), 10_000.0)  # сегодняшняя свеча неполная
     mat = date(2035, 1, 1)
     rows = [{"ticker": "A", "floater": False, "ytm": 0.15, "duration": 6.0, "turnover": 2e7, "maturity": mat, "next_coupon": None},
             {"ticker": "B", "floater": False, "ytm": 0.16, "duration": 7.0, "turnover": 2e7, "maturity": mat, "next_coupon": None},
@@ -1089,6 +1094,14 @@ def test_bond_advisor():
     assert close(g[ba.GROUP_FIXED]["weight"], 25.0) and close(g[ba.GROUP_SHORT]["weight"], 15.0) and close(g[ba.GROUP_CASH]["weight"], 10.0)
     assert close(sum(i["weight"] for i in g[ba.GROUP_FIXED]["items"]), 100.0, 0.2)
     assert {"ticker": "SU26207RMFS9", "weight": 0} in g[ba.GROUP_FIXED]["items"]
+    # доля корзины без ликвидного выпуска уходит в LQDT; сумма групп = облигационная часть, внутри групп 100
+    g2 = ba.fragment_groups({"LQDT": 0.2, "OFZ10Y": 0.5, "OFZ5Y": 0.3}, 50.0, {"OFZ10Y": ["B", "Z"]}, {ba.GROUP_FIXED: ["Z"], ba.GROUP_SHORT: ["Z", "Q"]})
+    gd = {x["name"]: x for x in g2}
+    assert close(sum(x["weight"] for x in g2), 50.0) and close(gd[ba.GROUP_FIXED]["weight"], 25.0) and close(gd[ba.GROUP_CASH]["weight"], 25.0)
+    assert close(gd[ba.GROUP_SHORT]["weight"], 0.0) and [i["ticker"] for i in gd[ba.GROUP_SHORT]["items"]] == ["Q"]  # Z куплен в другой группе
+    for x in g2:
+        if x["weight"] > 0:
+            assert close(sum(i["weight"] for i in x["items"]), 100.0, 0.2), x
     # текущая структура и замена гасящегося выпуска
     cur_groups = [{"name": "Акции РФ", "weight": 40.0, "items": [{"ticker": "TMOS@", "weight": 100.0}]},
                   {"name": ba.GROUP_FIXED, "weight": 35.0, "items": [{"ticker": "X", "weight": 100.0}]},
@@ -1113,6 +1126,70 @@ def test_bond_advisor():
     text, out = bres.advise_report(s, fin, hold, held, rows, ["предупреждение"], cur_groups)
     assert out["weights"] == rec and "предупреждение" in text
     assert {"ticker": "F", "weight": 0} in [i for g2 in out["groups"] for i in g2["items"]], out["groups"]  # гасящийся — с весом 0
+    # collect_candidates с поддельным API
+    class FakeApi:
+        def list_bonds(self):
+            base = {"currency": "rub", "forIisFlag": True, "maturityDate": "2040-01-01T00:00:00Z", "nominal": {"units": "1000", "nano": 0}}
+            return [dict(base, uid="u1", ticker="SU1", name="Один", lot=2, aciValue={"units": "10", "nano": 500000000}),
+                    dict(base, uid="u2", ticker="SU2", lot=1),                       # нет цены
+                    dict(base, uid="u3", ticker="SU3", lot=1),                       # нет купонов
+                    dict(base, uid="u4", ticker="SU4", lot=1, floatingCouponFlag=True),
+                    dict(base, uid="u5", ticker="SU5", lot=1),                       # доходность не сходится
+                    dict(base, uid="u6", ticker="SU6", lot=1),                       # неликвид
+                    dict(base, uid="u7", ticker="RU7", lot=1)]                       # не ОФЗ
+
+        def get_last_prices(self, uids):
+            return {"u1": 100.0, "u3": 100.0, "u4": 100.0, "u5": 0.01, "u6": 100.0}
+
+        def get_day_candles(self, uid, a, b):
+            vol = 1 if uid == "u6" else 100000
+            return [{"time": "2026-01-01T00:00:00Z", "close": 100.0, "volume": vol}]
+
+        def get_bond_coupons(self, uid, figi, a, b):
+            if uid == "u3":
+                return []
+            return [{"couponDate": "2026-07-01T00:00:00Z", "payOneBond": {"units": "50", "nano": 0}},
+                    {"couponDate": "2027-01-01T00:00:00Z", "payOneBond": {"units": "50", "nano": 0}}]
+
+    crow, cwarn = bres.collect_candidates(FakeApi(), date(2026, 1, 2))
+    cd = {r["ticker"]: r for r in crow}
+    assert sorted(cd) == ["SU1", "SU4"], sorted(cd)
+    assert close(cd["SU1"]["turnover"], 100000 * 2 * 1000.0), cd["SU1"]  # лоты × лот × цена(% номинала) × номинал
+    y1, d1 = ba.bond_metrics(1000.0 + 10.5, 1000.0, [(date(2026, 7, 1), 50.0), (date(2027, 1, 1), 50.0)], date(2040, 1, 1), date(2026, 1, 2))
+    assert cd["SU1"]["ytm"] is not None and cd["SU4"]["ytm"] is None and cd["SU4"]["floater"]
+    assert y1 is not None
+    wtext = " ".join(cwarn)
+    assert "SU2" in wtext and "SU3" in wtext and "SU5" in wtext and "SU6" not in wtext and "RU7" not in wtext, cwarn
+    # advise_main без токена: блоки 1 и 4 есть, кандидаты пропущены с пометкой
+    import io
+    import contextlib
+    import tempfile as _tf
+    tvars = ("TINVEST_TOKEN", "T_INVEST_IIS_READ", "T_INVEST_TOKEN", "T_INVEST_READ", "TINVEST_HOME")
+    saved = {k: os.environ.get(k) for k in tvars}
+    orig = (bres.held_bonds, bres.mi.fetch_zcyc)
+    try:
+        with _tf.TemporaryDirectory() as td:
+            for k in tvars:
+                os.environ.pop(k, None)
+            os.environ["TINVEST_HOME"] = td
+            bres.held_bonds = lambda: []
+
+            def no_net(d):
+                raise OSError("нет сети")
+            bres.mi.fetch_zcyc = no_net
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                bres.advise_main(_bond_series())
+            txt = buf.getvalue()
+            assert "## Рынок сейчас" in txt and "## Фрагмент targets.yaml" in txt, txt
+            assert "Нет доступа к API — кандидаты не подобраны" in txt and "нет доступа к API" in txt, txt
+    finally:
+        bres.held_bonds, bres.mi.fetch_zcyc = orig
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
     print("bond_advisor ok")
 
 

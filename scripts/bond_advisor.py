@@ -17,6 +17,7 @@ BUCKET_RU = {"OFZ1Y": "до 1 года", "OFZ3Y": "1–3 года", "OFZ5Y": "3�
 MIN_TURNOVER = 10_000_000.0   # ₽ в день: ниже — спред съедает часть доходности даже на взносе 100 тыс.
 TURNOVER_DAYS = 20
 TOP_N = 3
+TRADING_NORMAL = "SECURITY_TRADING_STATUS_NORMAL_TRADING"
 MATURING_DAYS = 365
 GROUP_FIXED, GROUP_SHORT, GROUP_CASH = "ОФЗ с фикс. купоном", "Флоатеры и корпоративные", "Денежный рынок"
 GROUP_BUCKETS = [(GROUP_FIXED, ["OFZ3Y", "OFZ5Y", "OFZ10Y"]), (GROUP_SHORT, ["OFZ1Y"]), (GROUP_CASH, ["LQDT"])]
@@ -47,17 +48,21 @@ def bond_metrics(dirty: float, nominal: float, coupons: Sequence[Tuple[date, flo
 
 
 def is_candidate(b: Dict[str, Any], t0: date, min_days: int = 30) -> bool:
-    """ОФЗ в рублях, без амортизации, не ОФЗ-ИН (SU52…), не бессрочная, доступна к покупке, гасится позже min_days."""
+    """ОФЗ в рублях, для ИИС, без амортизации, не ОФЗ-ИН (SU52…), не бессрочная, доступна к покупке, в нормальных торгах
+    (если статус указан), гасится позже min_days."""
     ticker = b.get("ticker") or ""
     mat = parse_date(b.get("maturityDate"))
     return (ticker.startswith("SU") and not ticker.startswith("SU52") and (b.get("currency") or "rub").lower() == "rub"
+            and b.get("forIisFlag") is True and b.get("tradingStatus", TRADING_NORMAL) == TRADING_NORMAL
             and not b.get("amortizationFlag") and not b.get("perpetualFlag") and b.get("buyAvailableFlag", True) is not False
             and mat is not None and (mat - t0).days > min_days)
 
 
-def turnover_rub(candles: Sequence[Dict[str, Any]], nominal: float, lot: int, days: int = TURNOVER_DAYS) -> float:
-    """Средний дневной оборот в ₽ за последние days свечей: лоты × лот × цена (% номинала) × номинал."""
-    last = [c for c in candles if c.get("close")][-days:]
+def turnover_rub(candles: Sequence[Dict[str, Any]], nominal: float, lot: int, days: int = TURNOVER_DAYS,
+                 today: Optional[date] = None) -> float:
+    """Средний дневной оборот в ₽ за последние days свечей: лоты × лот × цена (% номинала) × номинал.
+    Свеча сегодняшнего дня неполная — не учитывается."""
+    last = [c for c in candles if c.get("close") and not (today and parse_date(c.get("time")) == today)][-days:]
     if not last:
         return 0.0
     return sum(c["volume"] * lot * c["close"] / 100.0 * nominal for c in last) / len(last)
@@ -82,7 +87,13 @@ def fragment_groups(weights: Dict[str, float], sleeve: float, buy: Dict[str, Lis
                     hold_zero: Dict[str, List[str]]) -> List[Dict[str, Any]]:
     """Облигационные группы targets.yaml: weights — доли корзин внутри облигационной части (сумма 1), sleeve — её доля
     портфеля в %, buy — тикеры для покупки по корзинам, hold_zero — держим, но не докупаем (вес 0) по группам."""
+    weights = dict(weights)
+    for b in list(weights):  # доля корзины без ликвидного выпуска уходит в LQDT: deploy нормирует состав внутри группы
+        if b != "LQDT" and weights[b] > 0 and not buy.get(b):
+            weights["LQDT"] = weights.get("LQDT", 0.0) + weights[b]
+            weights[b] = 0.0
     out = []
+    bought = set()
     for name, buckets in GROUP_BUCKETS:
         gw = sum(weights.get(b, 0.0) for b in buckets)
         items: Dict[str, float] = {}
@@ -91,9 +102,13 @@ def fragment_groups(weights: Dict[str, float], sleeve: float, buy: Dict[str, Lis
             if gw > 0 and weights.get(b, 0.0) > 0 and tickers:
                 for t in tickers:
                     items[t] = items.get(t, 0.0) + weights[b] / gw / len(tickers) * 100.0
-        for t in hold_zero.get(name, []):
-            items.setdefault(t, 0.0)
-        out.append({"name": name, "weight": gw * sleeve, "items": [{"ticker": t, "weight": w} for t, w in items.items()]})
+        bought |= {t for t, w in items.items() if w > 0}
+        out.append({"name": name, "weight": gw * sleeve, "items": items})
+    for g in out:  # держим, но не докупаем; выпуск, который покупается в другой группе, второй раз не пишем
+        for t in hold_zero.get(g["name"], []):
+            if t not in bought:
+                g["items"].setdefault(t, 0.0)
+        g["items"] = [{"ticker": t, "weight": w} for t, w in g["items"].items()]
     return out
 
 

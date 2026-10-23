@@ -34,6 +34,7 @@ HOLDOUT: bp.Window = (date(2023, 1, 1), None)
 WINDOWS = {"TRAIN": TRAIN, "VALID": VALID, "HOLDOUT": HOLDOUT}
 COST, SLIP = 0.0004, 0.0005
 CAL = "RGBITR"
+FLOAT_KEY = "FLOAT"  # ключ замены гасящегося флоатера в maturing/repl
 SAFE = "LQDT"
 HEAD = ["Вариант", "Итог", "Доходность, год.", "Макс. просадка", "Sharpe", "Сделок с ОФЗ/год", "В ОФЗ", "Издержки", "Налог"]
 VERDICT_TEXT = {
@@ -353,7 +354,7 @@ def advise_report(series, finalists: Dict[str, Any], holdout: Dict[str, Any], he
             ends = [d for d in (h["maturity"], h["call"]) if d]
             end = min(ends) if ends else None
             if end is not None and (end - t0).days <= ba.MATURING_DAYS:
-                maturing[h["ticker"]] = b or "OFZ1Y"
+                maturing[h["ticker"]] = FLOAT_KEY if h["floater"] else (b or "OFZ1Y")
             # гасящийся выпуск тоже остаётся в группе с весом 0: deploy не должен считать его «чужим» и не докупает
             hold_zero[ba.GROUP_FIXED if h["ofz"] and not h["floater"] else ba.GROUP_SHORT].append(h["ticker"])
             rows.append([h["ticker"], (h["name"] or "")[:30], fmt_money(h["value_rub"]),
@@ -378,18 +379,20 @@ def advise_report(series, finalists: Dict[str, Any], holdout: Dict[str, Any], he
                               for r in by.get(b, [])]) if by.get(b) else "Ликвидных выпусков нет."]
         out += ["", "### Флоатеры",
                 md_table(["Выпуск", "Ближайший купон", "Погашение", "Оборот/день"],
-                         [[r["ticker"], f"{r['next_coupon'][0]}: {fmt_money(r['next_coupon'][1], digits=2)}" if r.get("next_coupon") else "—",
+                         [[r["ticker"], f"{r['next_coupon'][0]}: {fmt_money(r['next_coupon'][1], digits=2)}"
+                           if r.get("next_coupon") and r["next_coupon"][1] else "—",
                            str(r["maturity"]), fmt_money(r["turnover"])] for r in fl]) if fl else "Ликвидных флоатеров нет.", ""]
-    repl = {b: v[0]["ticker"] for b, v in by.items() if v}
+    repl = {b: v[0]["ticker"] for b, v in by.items() if v}  # заменитель фикс-купонного выпуска — только фикс-купонный
     if fl:
-        repl["OFZ1Y"] = fl[0]["ticker"]
+        repl[FLOAT_KEY] = fl[0]["ticker"]  # флоатер заменяет только флоатер
     if rec:
         sleeve = (ba.current_weights(cfg_groups)[1] if cfg_groups else 0.0) or 50.0
         buy = {b: [r["ticker"] for r in by.get(b, [])[:2]] for b in ("OFZ3Y", "OFZ5Y", "OFZ10Y")}
-        buy["OFZ1Y"] = [repl["OFZ1Y"]] if repl.get("OFZ1Y") else []
+        short = repl.get(FLOAT_KEY) or repl.get("OFZ1Y")  # группа «Флоатеры и корпоративные»: флоатер, иначе короткая ОФЗ
+        buy["OFZ1Y"] = [short] if short else []
         groups = ba.fragment_groups(rec, sleeve, buy, hold_zero)
         notes = [f"Деление по правилу {rec_name}; облигационная часть {sleeve:g}% портфеля."]
-        notes += [f"Корзина {b}: нет ликвидного выпуска — её доля останется деньгами при deploy." for b, x in rec.items()
+        notes += [f"доля {b} перенесена в LQDT: нет ликвидных выпусков" for b, x in rec.items()
                   if x > 0 and b != "LQDT" and not buy.get(b)]
     elif cfg_groups:
         groups, notes = ba.replace_maturing(cfg_groups, maturing, repl)
@@ -410,6 +413,8 @@ def held_bonds() -> List[Dict[str, Any]]:
     store = Store(data_dir())
     out = []
     for acc in store.account_ids():
+        if not store.is_iis(acc):
+            continue
         for p in store.valued_positions(acc):
             if p["type"] == "bond" and (p["value_rub"] or 0) > 0:
                 out.append(bonds.analyze_bond(store, acc, p))
@@ -427,7 +432,7 @@ def collect_candidates(api, t0: date) -> Tuple[List[Dict[str, Any]], List[str]]:
         if not lp or nominal <= 0:
             warns.append(f"{b['ticker']}: нет цены или номинала — пропущен")
             continue
-        turnover = ba.turnover_rub(api.get_day_candles(uid, t0 - timedelta(days=40), t0), nominal, int(b.get("lot") or 1))
+        turnover = ba.turnover_rub(api.get_day_candles(uid, t0 - timedelta(days=40), t0), nominal, int(b.get("lot") or 1), today=t0)
         if turnover < ba.MIN_TURNOVER:
             continue
         cps = [(parse_date(c.get("couponDate")), money(c.get("payOneBond"))) for c in api.get_bond_coupons(uid, b.get("figi"), t0, mat)]
@@ -440,6 +445,9 @@ def collect_candidates(api, t0: date) -> Tuple[List[Dict[str, Any]], List[str]]:
                 warns.append(f"{b['ticker']}: нет купонов в API — пропущен")
                 continue
             row["ytm"], row["duration"] = ba.bond_metrics(lp / 100.0 * nominal + money(b.get("aciValue")), nominal, cps, mat, t0)
+            if row["ytm"] is None:
+                warns.append(f"{b['ticker']}: доходность не посчиталась — пропущен")
+                continue
         rows.append(row)
     return rows, warns
 
