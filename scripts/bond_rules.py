@@ -52,6 +52,9 @@ def rate_cycle(view: View, p: dict, state: dict) -> Dict[str, float]:
         return {}
     since = _months_ago(view, p["M"])
     window = [v for d, v in zip(ds, vs) if d >= since] or [vs[-1]]
+    seed = view.asof("KEYRATE", "close", since)  # ставка, действовавшая на начало окна (ряд может хранить только даты изменений)
+    if seed is not None:
+        window.append(seed)
     return {p["bucket"]: 1.0} if max(window) - vs[-1] >= p["d"] - 1e-12 else {}
 
 

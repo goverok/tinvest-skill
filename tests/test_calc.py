@@ -317,6 +317,20 @@ def test_bond_series():
     a = simulate(s2, half, {}, start=d0, end=days[-1], universe=["OFZ5Y"], calendar="RGBITR", rebalance="monthly")
     b = simulate(s2, half, {}, start=d0, end=days[-1], universe=["OFZ5Y"], rebalance="monthly")
     assert close(a["final"], b["final"]) and a["trades"] == b["trades"] and a["trades"], (a["final"], b["final"])
+    # delay: 0 — то же, что без параметра; 1 — каждая сделка на один бар календаря позже
+    a0 = simulate(s2, half, {}, start=d0, end=days[-1], universe=["OFZ5Y"], calendar="RGBITR", rebalance="monthly", delay=0)
+    assert a0["trades"] == a["trades"] and close(a0["final"], a["final"])
+    a1 = simulate(s2, half, {}, start=d0, end=days[-1], universe=["OFZ5Y"], calendar="RGBITR", rebalance="monthly", delay=1)
+    shifted = [days[days.index(t["date"]) + 1] for t in a["trades"] if t["date"] != days[-1]]   # ликвидация — всегда в конце окна
+    assert shifted and [t["date"] for t in a1["trades"] if t["date"] != days[-1]] == shifted, (a["trades"], a1["trades"])
+    # при ежедневном ребалансе заявки не теряются, а встают в очередь: первая исполняется через 1 + delay баров
+    dd = simulate(s2, half, {}, start=d0, end=days[-1], universe=["OFZ5Y"], calendar="RGBITR", delay=2)
+    assert dd["trades"][0]["date"] == days[3], dd["trades"][:2]
+    try:
+        simulate(s2, half, {}, start=d0, end=days[-1], universe=["OFZ5Y"], calendar="RGBITR", delay=-1)
+        raise AssertionError("delay < 0 принят")
+    except ValueError:
+        pass
     print("bond_series ok")
 
 
@@ -354,6 +368,12 @@ def test_bond_rules():
     assert br.rate_cycle(v2, {"M": 6, "d": 0.005, "bucket": "OFZ5Y"}, {}) == {}
     assert br.rate_cycle(v2, {"M": 12, "d": 0.005, "bucket": "OFZ5Y"}, {}) == {"OFZ5Y": 1.0}
     assert br.rate_cycle(v2, {"M": 6, "d": 0.0, "bucket": "OFZ5Y"}, {}) == {"OFZ5Y": 1.0}   # d=0 — держать всегда
+    # ряд только из дат изменений: 16% с дня 0, снижение до 14% два месяца назад — в окне 6 мес. одна точка 14%,
+    # но ставка на начало окна (16%) учитывается: снижение на 2 п.п. >= 1 п.п.
+    sparse = lvl("KEYRATE", [0.16, 0.14], [days[0], days[399 - 61]])
+    v3 = View(dict(base, KEYRATE=sparse), last, br.UNIVERSE, "RGBITR")
+    assert br.rate_cycle(v3, {"M": 6, "d": 0.01, "bucket": "OFZ10Y"}, {}) == {"OFZ10Y": 1.0}
+    assert br.rate_cycle(v3, {"M": 6, "d": 0.03, "bucket": "OFZ10Y"}, {}) == {}
     # ts_momentum: OFZ10Y быстрее LQDT, OFZ5Y падает, OFZ1Y/3Y стоят
     s = dict(base, KEYRATE=kr)
     s["OFZ10Y"] = lvl("OFZ10Y", [100.0 * 1.001 ** i for i in range(400)])
@@ -1034,6 +1054,9 @@ def test_bond_research():
                    "HOLDOUT": (date(2021, 1, 1), date(2021, 7, 3))}
         text, data = bres.train_report(s, ["curve"], 3, 1_000_000.0, windows)
         assert "Финалист" in text and br.CURRENT_NAME in text and "Допущения" in text, text[:500]
+        assert "исполнение на день позже" in text and "исполнение по close" not in text
+        assert "цены открытия нет, исполнение по закрытию следующего торгового дня" in text and "Первый месяц каждого окна" in text
+        assert "включая покупку и продажу LQDT" in text
         assert data["curve"]["finalist"] in bp.all_variants("curve", br.FAMILIES)
         # журнал облигаций — свой файл; журнал акций не создаётся
         fam, params = bp.parse_finalist("curve:bucket=OFZ10Y,s=0.01", br.FAMILIES)
@@ -1047,6 +1070,85 @@ def test_bond_research():
         # правило, не обыгравшее «как сейчас», не получает вердикт 1–2
         cur = {"xirr": 0.10}
         assert bres.cap_verdict(1, "x", {"xirr": 0.09}, cur)[0] == 3 and bres.cap_verdict(2, "x", {"xirr": 0.11}, cur) == (2, "x")
+        assert bres.cap_verdict(1, "x", {"xirr": 0.10}, cur)[0] == 3                       # равный XIRR на ИИС — не выше
+        # вердикт 1 требует и брокерский режим выше брокерского «как сейчас»; равенство — не выше
+        cb = {"xirr": 0.08}
+        assert bres.cap_verdict(1, "x", {"xirr": 0.11}, cur, {"xirr": 0.09}, cb) == (1, "x")
+        v_, t_ = bres.cap_verdict(1, "x", {"xirr": 0.11}, cur, {"xirr": 0.08}, cb, v2_ok=True)
+        assert v_ == 2 and "брокерском" in t_, t_
+        assert bres.cap_verdict(1, "x", {"xirr": 0.11}, cur, {"xirr": 0.08}, cb, v2_ok=False)[0] == 3
+        assert bres.cap_verdict(2, "x", {"xirr": 0.11}, cur, {"xirr": 0.01}, cb) == (2, "x")    # вердикт 2 — только ИИС
+        assert "обоих налоговых режимах" in bres.VERDICT_TEXT[1] and "ИИС" in bres.VERDICT_TEXT[2]
+        # закрытое окно — только для финалиста TRAIN, прошедшего VALID
+        import contextlib
+        import io
+        fp = bres.finalists_path()
+        if fp.exists():
+            fp.unlink()
+
+        def refused(fins, force=False):
+            try:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    bres.guard_finalists(fins, fp, force)
+            except SystemExit as e:
+                return str(e)
+            return None
+        ok_f = ("curve", {"bucket": "OFZ10Y", "s": 0.01})
+        assert "train" in (refused([ok_f]) or ""), "нет finalists.json — отказ"
+        assert "train" in (refused([ok_f], force=True) or ""), "нет finalists.json — отказ и с --force-finalists"
+        bres.write_json(fp, {"curve": {"params": {"bucket": "OFZ10Y", "s": 0.01}, "passed": True},
+                             "rate_cycle": {"params": {"M": 6, "d": 0.01, "bucket": "OFZ10Y"}, "passed": False}})
+        assert bres.guard_finalists([ok_f], fp) == []                                              # прошедший финалист
+        assert "не финалист" in (refused([("curve", {"bucket": "OFZ5Y", "s": 0.01})]) or "")         # чужие параметры
+        assert "не финалист" in (refused([("ts_momentum", {"L": 3, "set": "all"})]) or "")          # семейства нет в файле
+        rc = ("rate_cycle", {"M": 6, "d": 0.01, "bucket": "OFZ10Y"})
+        assert "не прошёл VALID" in (refused([rc]) or "") and "--force-finalists" in (refused([rc]) or "")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            forced = bres.guard_finalists([ok_f, rc], fp, force=True)
+        assert len(forced) == 1 and "не прошёл VALID" in forced[0] and "ВНИМАНИЕ" in err.getvalue(), (forced, err.getvalue())
+        # таблица данных: пропуски дат корзины относительно RGBITR и пустые КБД на концах месяцев
+        sec = bres.data_section(s, date(2020, 1, 1), date(2021, 7, 3))
+        assert "⚠" not in sec and "Нет дат RGBITR" in sec, sec
+        sg = {k: dict(v) for k, v in s.items()}
+        drop = {date(2020, 3, 2), date(2020, 3, 3), date(2020, 3, 4)}
+        for f in ("dates", "open", "high", "low", "close", "tr", "volume", "duration", "yield"):
+            sg["OFZ5Y"][f] = [x for d, x in zip(s["OFZ5Y"]["dates"], s["OFZ5Y"][f]) if d not in drop]
+        for t in ("ZCYC1", "ZCYC10"):   # КБД на 31.03.2020 нет ({} в кэше moex_iss)
+            sg[t] = {**sg[t], "dates": [d for d in s[t]["dates"] if d != date(2020, 3, 31)]}
+            sg[t]["close"] = [0.065] * len(sg[t]["dates"])
+        assert bres.bucket_gaps(sg, date(2020, 1, 1), date(2021, 7, 3)) == {"OFZ1Y": 0, "OFZ3Y": 0, "OFZ5Y": 3, "OFZ10Y": 0}
+        assert bres.zcyc_gaps(sg, date(2020, 1, 1), date(2021, 7, 3)) == [date(2020, 3, 31)]
+        assert bres.zcyc_gaps(sg, date(2020, 4, 1), date(2021, 7, 3)) == []
+        sec = bres.data_section(sg, date(2020, 1, 1), date(2021, 7, 3))
+        assert "⚠ В корзинах нет" in sec and "OFZ5Y — 3" in sec and "⚠ КБД нет на 1" in sec and "2020-03-31" in sec, sec
+        # пустой ряд — строка «нет данных» и предупреждение, без падения
+        se = dict(s, ZCYC3={**s["ZCYC3"], "dates": [], "close": []})
+        assert "нет данных" in bres.data_section(se) and "Пустые ряды: ZCYC3" in bres.data_section(se)
+        assert "КБД 3 г." not in bres.market_section(se) and "КБД 1 г." in bres.market_section(se)
+        sk = dict(s, KEYRATE={**s["KEYRATE"], "dates": [], "close": []}, ZCYC1={**s["ZCYC1"], "dates": [], "close": []})
+        mk = bres.market_section(sk)
+        assert "Ключевая ставка | нет данных" in mk and "КБД | нет данных" in mk, mk
+        # хвост LQDT: отстаёт больше чем на 2 дня — конец закрытого окна и «сегодня» советника по LQDT
+        assert bres.data_end(s) == (s["RGBITR"]["dates"][-1], None)
+        cut = s["LQDT"]["dates"][-10]
+        sl = dict(s, LQDT={k: (v[:-9] if isinstance(v, list) else v) for k, v in s["LQDT"].items()})
+        sl["LQDT"]["divs"], sl["LQDT"]["warnings"] = [], []
+        assert sl["LQDT"]["dates"][-1] == cut
+        end_, msg = bres.data_end(sl)
+        assert end_ == cut and msg and "⚠" in msg, (end_, msg)
+        w2, _ = bres.effective_windows(sl, windows)
+        assert w2["HOLDOUT"] == (windows["HOLDOUT"][0], cut) and w2["TRAIN"] == windows["TRAIN"]
+        w3, _ = bres.effective_windows(sl, dict(windows, HOLDOUT=(date(2021, 1, 1), None)))
+        assert w3["HOLDOUT"][1] == cut
+        sl2 = dict(s, LQDT={k: (v[:-2] if isinstance(v, list) else v) for k, v in s["LQDT"].items()})
+        sl2["LQDT"]["divs"], sl2["LQDT"]["warnings"] = [], []
+        assert bres.data_end(sl2)[1] is None                                                          # 2 дня — в допуске
+        htext, _ = bres.holdout_report(sl, [(fam, params)], 1_000_000.0, [], n_trials=2,
+                                       windows=dict(windows, HOLDOUT=(date(2021, 1, 1), None)))
+        assert f"закрытое окно (2021-01-01 — {cut})" in htext and "⚠ LQDT есть только по" in htext, htext[:400]
+        atext, _ = bres.advise_report(sl, {}, {}, [], None, [], None)
+        assert "⚠ LQDT есть только по" in atext, atext
     finally:
         if old_home is None:
             os.environ.pop("TINVEST_HOME", None)
@@ -1107,8 +1209,8 @@ def test_bond_advisor():
                   {"name": ba.GROUP_FIXED, "weight": 35.0, "items": [{"ticker": "X", "weight": 100.0}]},
                   {"name": ba.GROUP_SHORT, "weight": 10.0, "items": [{"ticker": "F", "weight": 100.0}]},
                   {"name": ba.GROUP_CASH, "weight": 5.0, "items": [{"ticker": "LQDT", "weight": 100.0}]}]
-    w, sleeve = ba.current_weights(cur_groups)
-    assert close(sleeve, 50.0) and close(w["OFZ10Y"], 0.7) and close(w["OFZ1Y"], 0.2) and close(w["LQDT"], 0.1), (w, sleeve)
+    w, sleeve = ba.current_weights(cur_groups)   # облигационная часть — фикс. купон + флоатеры, без «Денежного рынка»
+    assert close(sleeve, 45.0) and close(w["OFZ10Y"], 7 / 9) and close(w["OFZ1Y"], 2 / 9) and "LQDT" not in w, (w, sleeve)
     new, notes = ba.replace_maturing(cur_groups, {"F": "OFZ1Y"}, {"OFZ1Y": ["D"]})
     short = [x for x in new if x["name"] == ba.GROUP_SHORT][0]
     assert {i["ticker"]: i["weight"] for i in short["items"]} == {"F": 0.0, "D": 100.0} and notes
@@ -1126,8 +1228,9 @@ def test_bond_advisor():
     new4, _ = ba.replace_maturing(dup, {"F": "OFZ1Y"}, {"OFZ1Y": ["D"]})  # единственный кандидат занят -> тоже LQDT
     assert close({x["name"]: x for x in new4}[ba.GROUP_CASH]["weight"], 15.0)
 
-    def check_fragment(frag, maturing, sleeve):
-        """Инварианты фрагмента: гасящиеся с весом 0, сумма групп = облигационная часть, внутри групп с весом > 0 — 100,
+    def check_fragment(frag, maturing, total, cash0=0.0):
+        """Инварианты фрагмента: гасящиеся с весом 0, сумма трёх групп = исходной сумме трёх групп (total), вес
+        «Денежного рынка» не меньше исходного (cash0) и LQDT в нём есть всегда, внутри групп с весом > 0 — 100,
         тикер не повторяется."""
         seen = []
         for g_ in frag:
@@ -1136,12 +1239,40 @@ def test_bond_advisor():
             assert all(items[t] == 0 for t in maturing if t in items), (g_, maturing)
             if g_["weight"] > 0:
                 assert close(sum(items.values()), 100.0), g_
-        assert close(sum(g_["weight"] for g_ in frag), sleeve), frag
+        assert close(sum(g_["weight"] for g_ in frag), total), frag
+        cash_ = [g_ for g_ in frag if g_["name"] == ba.GROUP_CASH]
+        assert len(cash_) == 1 and cash_[0]["weight"] >= cash0 - 1e-9, (frag, cash0)
+        assert "LQDT" in {i["ticker"] for i in cash_[0]["items"]}, cash_
         assert len(seen) == len(set(seen)), seen
     for frag in (groups, g2):
         check_fragment(frag, set(), 50.0)
     for frag in (new, new2, new3, new4):
-        check_fragment(frag, {"F"}, 50.0)
+        check_fragment(frag, {"F"}, 50.0, 5.0)
+    # доля LQDT по правилу ложится поверх текущего «Денежного рынка»: 45 облигаций + 5 = 50
+    cash5 = {"name": ba.GROUP_CASH, "weight": 5.0, "items": [{"ticker": "LQDT", "weight": 100.0}]}
+    g5 = {x["name"]: x for x in ba.fragment_groups({"LQDT": 0.2, "OFZ10Y": 0.5, "OFZ1Y": 0.3}, 45.0,
+                                                    {"OFZ10Y": ["B"], "OFZ1Y": ["D"]}, {}, cash5)}
+    assert close(g5[ba.GROUP_FIXED]["weight"], 22.5) and close(g5[ba.GROUP_SHORT]["weight"], 13.5), g5
+    assert close(g5[ba.GROUP_CASH]["weight"], 14.0) and g5[ba.GROUP_CASH]["items"] == [{"ticker": "LQDT", "weight": 100.0}], g5
+    check_fragment(list(g5.values()), set(), 50.0, 5.0)
+    # прочие бумаги «Денежного рынка» сохраняют свою долю портфеля; правило без LQDT — вес группы прежний, LQDT остаётся
+    cashx = {"name": ba.GROUP_CASH, "weight": 5.0, "items": [{"ticker": "AKMM", "weight": 100.0}]}
+    g6 = {x["name"]: x for x in ba.fragment_groups({"OFZ10Y": 1.0}, 45.0, {"OFZ10Y": ["B"]}, {}, cashx)}
+    assert close(g6[ba.GROUP_CASH]["weight"], 5.0) and {i["ticker"]: i["weight"] for i in g6[ba.GROUP_CASH]["items"]} == {"AKMM": 100.0, "LQDT": 0.0}
+    check_fragment(list(g6.values()), set(), 50.0, 5.0)
+    g7 = {x["name"]: x for x in ba.fragment_groups({"LQDT": 0.2, "OFZ10Y": 0.8}, 45.0, {"OFZ10Y": ["B"]}, {}, cashx)}
+    c7 = {i["ticker"]: i["weight"] for i in g7[ba.GROUP_CASH]["items"]}
+    assert close(g7[ba.GROUP_CASH]["weight"], 14.0) and close(c7["AKMM"], 500 / 14) and close(c7["LQDT"], 900 / 14), c7
+    # пустой «Денежный рынок» без веса — LQDT всё равно указан, items не пустой
+    g8 = ba.fragment_groups({"OFZ10Y": 1.0}, 45.0, {"OFZ10Y": ["B"]}, {})
+    c8 = [x for x in g8 if x["name"] == ba.GROUP_CASH][0]
+    assert c8["weight"] == 0.0 and c8["items"] == [{"ticker": "LQDT", "weight": 100.0}], c8
+    y8 = {x["name"]: x for x in yaml.safe_load(ba.render_groups(g8))["groups"]}
+    assert y8[ba.GROUP_CASH]["items"] == [{"ticker": "LQDT", "weight": 100}], y8
+    # replace_maturing без группы «Денежный рынок» в targets.yaml: группа появляется с LQDT
+    r9, _ = ba.replace_maturing([g_ for g_ in cur_groups if g_["name"] != ba.GROUP_CASH], {}, {})
+    c9 = [x for x in r9 if x["name"] == ba.GROUP_CASH][0]
+    assert c9["weight"] == 0.0 and c9["items"] == [{"ticker": "LQDT", "weight": 100.0}], c9
     # два гасящихся выпуска в одной группе: гасящийся кандидат не берётся, доли считаются от исходных весов,
     # порядок строк на результат не влияет
     mat2 = {"A": "OFZ1Y", "B": "OFZ1Y"}
@@ -1154,25 +1285,25 @@ def test_bond_advisor():
         d1 = {x["name"]: x for x in r1}
         assert close(d1[ba.GROUP_SHORT]["weight"], 10.0) and {i["ticker"]: i["weight"] for i in d1[ba.GROUP_SHORT]["items"]} == {"A": 0.0, "B": 0.0, "C": 100.0}, (order, r1)
         assert close(d1[ba.GROUP_CASH]["weight"], 5.0) and any("B" in n and "гасится" in n and "C" in n for n in n1), n1
-        check_fragment(r1, mat2, 15.0)
+        check_fragment(r1, mat2, 15.0, 5.0)
         r2, n2_ = ba.replace_maturing(short_cash(order), mat2, {"OFZ1Y": ["B"]})  # единственный кандидат гасится -> всё в LQDT
         d2 = {x["name"]: x for x in r2}
         assert close(d2[ba.GROUP_SHORT]["weight"], 0.0) and {i["ticker"]: i["weight"] for i in d2[ba.GROUP_SHORT]["items"]} == {"A": 0.0, "B": 0.0}, (order, r2)
         assert close(d2[ba.GROUP_CASH]["weight"], 15.0) and {i["ticker"]: i["weight"] for i in d2[ba.GROUP_CASH]["items"]} == {"LQDT": 100.0}
         assert sum("LQDT" in n for n in n2_) == 2, n2_
-        check_fragment(r2, mat2, 15.0)
+        check_fragment(r2, mat2, 15.0, 5.0)
         # A -> C, B без замены: в LQDT уходит ровно доля B (10 × 50/100 = 5), остаток группы снова 100
         r3, _ = ba.replace_maturing(short_cash(order), {"A": "OFZ1Y", "B": "FLOAT"}, {"OFZ1Y": ["C"]})
         d3 = {x["name"]: x for x in r3}
         assert close(d3[ba.GROUP_SHORT]["weight"], 5.0) and {i["ticker"]: i["weight"] for i in d3[ba.GROUP_SHORT]["items"]} == {"A": 0.0, "B": 0.0, "C": 100.0}, (order, r3)
         assert close(d3[ba.GROUP_CASH]["weight"], 10.0)
-        check_fragment(r3, mat2, 15.0)
+        check_fragment(r3, mat2, 15.0, 5.0)
     # группа без веса: гасящийся выпуск обнуляется, в LQDT ничего не переносится — и заметка об этом не врёт
     r4, n4 = ba.replace_maturing(short_cash(["A"], (100.0,), gw=0.0), {"A": "OFZ1Y"}, {})
     d4 = {x["name"]: x for x in r4}
     assert d4[ba.GROUP_SHORT]["weight"] == 0.0 and {i["ticker"]: i["weight"] for i in d4[ba.GROUP_SHORT]["items"]} == {"A": 0.0}
     assert close(d4[ba.GROUP_CASH]["weight"], 5.0) and len(n4) == 1 and "LQDT" not in n4[0] and "A" in n4[0], n4
-    check_fragment(r4, {"A"}, 5.0)
+    check_fragment(r4, {"A"}, 5.0, 5.0)
     # советник: сигнал финалиста с вердиктом 2 становится рекомендацией; без финалистов — текущая структура
     s = _bond_series()
     fin = {"curve": {"params": {"bucket": "OFZ10Y", "s": -0.01}, "passed": True}}
@@ -1192,12 +1323,29 @@ def test_bond_advisor():
     assert "Фрагмент targets.yaml" in text and "D" in text and out["weights"] is None, text
     og = {x["name"]: x for x in out["groups"]}
     assert {i["ticker"]: i["weight"] for i in og[ba.GROUP_SHORT]["items"]} == {"F": 0.0, "D": 100.0}, og
-    check_fragment(out["groups"], {"F"}, 50.0)
+    check_fragment(out["groups"], {"F"}, 50.0, 5.0)
     text, out = bres.advise_report(s, fin, hold, held, rows2, ["предупреждение"], cur_groups)
+    assert "облигационная часть (фикс. купон + флоатеры) 45%" in text and "добавлена к текущим 5%" in text, text
+    assert "индекс ОФЗ с фикс. купоном до 1 года" in text and "не входит в проверенное правило" in text, text
     assert out["weights"] == rec and "предупреждение" in text
     assert {"ticker": "F", "weight": 0} in [i for g2 in out["groups"] for i in g2["items"]], out["groups"]  # гасящийся — с весом 0
     assert "S" not in {i["ticker"] for g2 in out["groups"] for i in g2["items"]}, out["groups"]
-    check_fragment(out["groups"], {"F"}, 50.0)
+    check_fragment(out["groups"], {"F"}, 50.0, 5.0)
+    # без targets.yaml — облигации 45 и «Денежный рынок» 5
+    _, out0 = bres.advise_report(s, fin, hold, held, rows2, [], None)
+    check_fragment(out0["groups"], {"F"}, 50.0, 5.0)
+    # гасящийся фикс-купонный выпуск из группы длинных ОФЗ заменяется длинным кандидатом, хотя его дюрация уже короткая
+    long_groups = [{"name": ba.GROUP_FIXED, "weight": 35.0, "items": [{"ticker": "SU26207RMFS9", "weight": 20.0},
+                                                                      {"ticker": "X", "weight": 80.0}]},
+                   {"name": ba.GROUP_SHORT, "weight": 10.0, "items": [{"ticker": "D", "weight": 100.0}]},
+                   {"name": ba.GROUP_CASH, "weight": 5.0, "items": [{"ticker": "LQDT", "weight": 100.0}]}]
+    held7 = [{"ticker": "SU26207RMFS9", "name": "ОФЗ 26207", "value_rub": 1000.0, "ytm": 0.15, "duration_mod": 0.3,
+              "floater": False, "maturity": t_last + timedelta(days=100), "call": None, "ofz": True}]
+    _, out7 = bres.advise_report(s, {}, {}, held7, rows, [], long_groups)
+    o7 = {x["name"]: x for x in out7["groups"]}
+    assert close(o7[ba.GROUP_FIXED]["weight"], 35.0), o7
+    assert {i["ticker"]: round(i["weight"], 6) for i in o7[ba.GROUP_FIXED]["items"]} == {"SU26207RMFS9": 0.0, "X": 80.0, "B": 20.0}, o7
+    check_fragment(out7["groups"], {"SU26207RMFS9"}, 50.0, 5.0)
     # collect_candidates с поддельным API
     class FakeApi:
         def list_bonds(self):

@@ -3,7 +3,7 @@
 
   python bond_research.py fetch [--refresh]       индексы ОФЗ, КБД, ключевая ставка, LQDT
   python bond_research.py train [--family curve] [--random 200]
-  python bond_research.py holdout curve:bucket=OFZ10Y,s=0.01 [--yes]
+  python bond_research.py holdout curve:bucket=OFZ10Y,s=0.01 [--yes] [--force-finalists]
   python bond_research.py advise                  рынок, ваши облигации, кандидаты, фрагмент targets.yaml
   python bond_research.py all                     fetch + train + advise (holdout — только явно)
 
@@ -36,10 +36,13 @@ COST, SLIP = 0.0004, 0.0005
 CAL = "RGBITR"
 FLOAT_KEY = "FLOAT"  # ключ замены гасящегося флоатера в maturing/repl
 SAFE = "LQDT"
+LQDT_LAG_DAYS = 2  # LQDT отстаёт от индексов больше — закрытое окно и «сегодня» советника обрезаются по LQDT
+SLEEVE_DEFAULT, CASH_DEFAULT = 45.0, 5.0  # без targets.yaml: облигации 35 + 10, «Денежный рынок» 5 (утверждено 15.10.2026)
 HEAD = ["Вариант", "Итог", "Доходность, год.", "Макс. просадка", "Sharpe", "Сделок с ОФЗ/год", "В ОФЗ", "Издержки", "Налог"]
 VERDICT_TEXT = {
     1: "Рекомендация: выше LQDT и структуры «как сейчас» в обоих налоговых режимах, просадка в допуске, эффект значим после поправки на перебор.",
-    2: "Эффект есть, но не бьёт LQDT: выше RGBITR и равных долей, значим после поправки; справочно.",
+    2: "Эффект есть, но не на вердикт 1 (ниже LQDT, просадка вне допуска или в брокерском режиме не выше «как сейчас»): "
+       "на ИИС выше RGBITR, равных долей и «как сейчас», значим после поправки на перебор.",
     3: "Ничего не найдено: результат на закрытом окне не отличим от перебора или не обыгрывает LQDT / «как сейчас».",
 }
 
@@ -62,12 +65,61 @@ def load_series(refresh: bool = False) -> Dict[str, Any]:
     return mi.build_series(raw, lqdt)
 
 
+def data_end(series) -> Tuple[date, Optional[str]]:
+    """Последняя дата, на которую есть и индексы, и LQDT: если LQDT отстаёт от RGBITR больше чем на LQDT_LAG_DAYS дней —
+    его последняя дата и предупреждение, иначе последняя дата RGBITR."""
+    cal_last = series[CAL]["dates"][-1]
+    lq = series[SAFE]["dates"]
+    if lq and (cal_last - lq[-1]).days > LQDT_LAG_DAYS:
+        return lq[-1], (f"⚠ LQDT есть только по {lq[-1]}, индексы — по {cal_last}: закрытое окно и сигналы советника "
+                        f"считаются по {lq[-1]}. Обнови свечи LQDT (`fetch.py`).")
+    return cal_last, None
+
+
+def effective_windows(series, windows: Optional[Dict[str, bp.Window]] = None) -> Tuple[Dict[str, bp.Window], Optional[str]]:
+    """Окна с концом HOLDOUT, обрезанным по data_end (если LQDT отстаёт)."""
+    windows = dict(windows or WINDOWS)
+    end, msg = data_end(series)
+    if msg:
+        h = windows["HOLDOUT"]
+        windows["HOLDOUT"] = (h[0], min(bp._end(h), end))
+    return windows, msg
+
+
+def _finalist_key(params: dict) -> str:
+    return json.dumps(params, sort_keys=True)
+
+
+def guard_finalists(finalists: List[Tuple[str, dict]], path: Path, force: bool = False) -> List[str]:
+    """Закрытое окно открывается только для финалистов TRAIN (finalists.json), прошедших VALID. Нет файла — SystemExit
+    всегда; чужой или не прошедший финалист — SystemExit, а с force — громкое предупреждение в stderr и список
+    нарушений для отчёта."""
+    stored = read_json(path, None)
+    if not stored:
+        raise SystemExit(f"Нет {path} — сначала запусти `bond_research.py train`: закрытое окно открывается только для финалистов TRAIN.")
+    problems = []
+    for fam, params in finalists:
+        info = stored.get(fam)
+        name = f"{fam} {_pstr(params)}"
+        if not info or _finalist_key(info.get("params") or {}) != _finalist_key(params):
+            problems.append(f"{name} — не финалист TRAIN своего семейства"
+                            + (f" (финалист: {_pstr(info['params'])})" if info and info.get("params") else ""))
+        elif not info.get("passed"):
+            problems.append(f"{name} — финалист TRAIN, но не прошёл VALID")
+    if problems and not force:
+        raise SystemExit("Закрытое окно не открыто:\n- " + "\n- ".join(problems)
+                         + "\nОткрыть всё равно — флаг --force-finalists (в отчёте будет отмечено как нарушение протокола).")
+    for pr in problems:
+        print(f"⚠⚠⚠ ВНИМАНИЕ, --force-finalists: {pr}. Закрытое окно открывается вне протокола.", file=sys.stderr)
+    return [f"открыто с --force-finalists: {pr}" for pr in problems]
+
+
 # ---------- прогоны ----------
 
 def run(series, fn, params: dict, window: bp.Window, *, tax_rate: Optional[float] = None, cost: float = COST,
-        slip: float = SLIP, fill: str = "open", capital: float = 1_000_000.0) -> Dict[str, Any]:
+        slip: float = SLIP, fill: str = "open", capital: float = 1_000_000.0, delay: int = 0) -> Dict[str, Any]:
     res = simulate(series, fn, params, start=window[0], end=bp._end(window), universe=br.UNIVERSE, capital=capital,
-                   cost=cost, slip=slip, tax_rate=tax_rate, fill=fill, rebalance="monthly", calendar=CAL)
+                   cost=cost, slip=slip, tax_rate=tax_rate, fill=fill, rebalance="monthly", calendar=CAL, delay=delay)
     s = summarize(res, series[SAFE])
     s["result"] = res
     return s
@@ -86,10 +138,18 @@ def random_sharpes(series, window: bp.Window, n: int, capital: float = 1_000_000
     return [run(series, br.random_bucket, {"seed": i}, window, capital=capital)["sharpe"] or 0.0 for i in range(n)]
 
 
-def cap_verdict(v: int, text: str, iis: dict, current: dict) -> Tuple[int, str]:
-    """Условие 4 спека: вердикты 1–2 — только если правило обыграло структуру «как сейчас»."""
-    if v < 3 and (iis["xirr"] or -1) <= (current["xirr"] or -1):
-        return 3, f"Не выше структуры «{br.CURRENT_NAME}» — менять облигационную часть незачем."
+def cap_verdict(v: int, text: str, iis: dict, current: dict, brk: Optional[dict] = None, current_brk: Optional[dict] = None,
+                v2_ok: bool = False) -> Tuple[int, str]:
+    """Условие 4 спека: вердикты 1–2 — только если правило обыграло структуру «как сейчас» на ИИС; вердикт 1 — ещё и
+    в брокерском режиме (brk против current_brk). Вердикт 1 без брокерского условия становится 2, если выполнены
+    условия вердикта 2 (v2_ok: значим и выше RGBITR и равных долей на ИИС), иначе 3."""
+    def x(s: dict) -> float:
+        return s["xirr"] or -1
+    if v < 3 and x(iis) <= x(current):
+        return 3, f"Не выше структуры «{br.CURRENT_NAME}» на ИИС — менять облигационную часть незачем."
+    if v == 1 and brk is not None and current_brk is not None and x(brk) <= x(current_brk):
+        why = f"в брокерском режиме не выше «{br.CURRENT_NAME}»"
+        return (2, VERDICT_TEXT[2] + f" Здесь: {why}.") if v2_ok else (3, f"Ничего не найдено: {why}, а условия вердикта 2 не выполнены.")
     return v, text
 
 
@@ -114,21 +174,61 @@ def row(name: str, s: dict, show_sharpe: bool = True) -> List[str]:
             f"{moves / _years(s):.1f}", fmt_pct(s["in_market"], 0), fmt_money(s["costs"]), fmt_money(s["taxes"])]
 
 
-def data_section(series) -> str:
+def _span(series, t: str) -> Tuple[str, str]:
+    d = (series.get(t) or {}).get("dates") or []
+    return (str(d[0]), str(d[-1])) if d else ("нет данных", "нет данных")
+
+
+def bucket_gaps(series, start: date, end: date) -> Dict[str, int]:
+    """Сколько дат RGBITR в [start, end] нет в ряду каждой корзины ОФЗ."""
+    cal = [d for d in series[CAL]["dates"] if start <= d <= end]
+    out = {}
+    for b in mi.BUCKETS:
+        have = set((series.get(b) or {}).get("dates") or [])
+        out[b] = sum(1 for d in cal if d not in have)
+    return out
+
+
+def zcyc_gaps(series, start: date, end: date) -> List[date]:
+    """Концы законченных месяцев RGBITR в [start, end] без КБД (хотя бы одного срока): ISS не отдал кривую,
+    moex_iss хранит такую дату как {}, и в ряды она не попадает."""
+    cal = series[CAL]["dates"]
+    ends = [d for i, d in enumerate(cal) if start <= d <= end and (d.year, d.month) < (end.year, end.month)
+            and (i == len(cal) - 1 or cal[i + 1].month != d.month)]
+    have = [set((series.get(t) or {}).get("dates") or []) for t in mi.ZCYC_TICKERS.values()]
+    return [d for d in ends if not all(d in h for h in have)]
+
+
+def data_section(series, start: Optional[date] = None, end: Optional[date] = None) -> str:
+    """Таблица рядов и проверки данных: пропуски дат корзин относительно RGBITR и КБД на концах месяцев в [start, end]
+    (по умолчанию от начала TRAIN до сегодня)."""
+    start, end = start or TRAIN[0], end or today()
     dur = mi.bucket_durations(series)
+    gaps = bucket_gaps(series, start, end)
     rows = []
     for t in ["RGBITR"] + list(mi.BUCKETS):
-        s = series[t]
         m = dur.get(t)
-        rows.append([t, str(s["dates"][0]), str(s["dates"][-1]),
-                     "—" if not m or m[0] is None else f"{m[0]:.1f} ({m[1]:.1f}–{m[2]:.1f})"])
+        rows.append([t, *_span(series, t), "—" if not m or m[0] is None else f"{m[0]:.1f} ({m[1]:.1f}–{m[2]:.1f})",
+                     str(gaps[t]) if t in gaps else "—"])
     for t in list(mi.ZCYC_TICKERS.values()) + ["KEYRATE", SAFE]:
-        s = series[t]
-        rows.append([t, str(s["dates"][0]), str(s["dates"][-1]), "—"])
+        rows.append([t, *_span(series, t), "—", "—"])
     med = [dur[b][0] for b in mi.BUCKETS]
     ordered = all(x is not None for x in med) and all(med[i] < med[i + 1] for i in range(len(med) - 1))
-    out = md_table(["Ряд", "С", "По", "Дюрация, лет: медиана (мин–макс)"], rows)
-    return out + ("" if ordered else "\n\n⚠ Корзины не упорядочены по медианной дюрации — проверь индексы.")
+    out = md_table(["Ряд", "С", "По", "Дюрация, лет: медиана (мин–макс)", f"Нет дат RGBITR с {start}"], rows)
+    warns = [] if ordered else ["⚠ Корзины не упорядочены по медианной дюрации — проверь индексы."]
+    bad = {b: n for b, n in gaps.items() if n}
+    if bad:
+        warns.append(f"⚠ В корзинах нет части торговых дней RGBITR с {start} по {end}: "
+                     + ", ".join(f"{b} — {n}" for b, n in bad.items())
+                     + ". Симулятор в эти дни корзину не торгует и оценивает по последнему close.")
+    zg = zcyc_gaps(series, start, end)
+    if zg:
+        warns.append(f"⚠ КБД нет на {len(zg)} концах месяцев с {start} по {end} (первые: "
+                     + ", ".join(str(d) for d in zg[:5]) + "): правило curve в эти месяцы берёт прошлую кривую.")
+    empty = [t for t in ["RGBITR", *mi.BUCKETS, *mi.ZCYC_TICKERS.values(), "KEYRATE", SAFE] if not (series.get(t) or {}).get("dates")]
+    if empty:
+        warns.append("⚠ Пустые ряды: " + ", ".join(empty) + ".")
+    return out + "".join("\n\n" + w for w in warns)
 
 
 def family_section(series, family: str, windows: Dict[str, bp.Window], n_random: int, capital: float) -> Tuple[str, dict]:
@@ -153,7 +253,7 @@ def family_section(series, family: str, windows: Dict[str, bp.Window], n_random:
     full = (train[0], valid[1])
     s_full = run_family(series, family, finalist, full, capital=capital)
     cost2 = run_family(series, family, finalist, full, capital=capital, cost=COST * 2, slip=SLIP * 2)
-    nclose = run_family(series, family, finalist, full, capital=capital, fill="next_close")
+    lagged = run_family(series, family, finalist, full, capital=capital, delay=1)
     lq_full = run_bench(series, "LQDT", full, capital=capital)
     beat, total = bp.years_beating(s_full["yearly"], lq_full["yearly"])
     sr_star, p = bp.dsr(s_train, len(variants))
@@ -166,7 +266,7 @@ def family_section(series, family: str, windows: Dict[str, bp.Window], n_random:
            f"Перцентиль Sharpe среди {len(rand)} случайных стратегий: {bp.percentile(rand, s_valid['sharpe'] or 0):.0%}. "
            + ("**Прошёл.**" if ok else "**Не прошёл:** " + "; ".join(why)), "",
            f"### Устойчивость ({_w(full)})",
-           md_table(HEAD, [row("базовый", s_full), row("издержки ×2", cost2), row("исполнение по close", nclose)]), "",
+           md_table(HEAD, [row("базовый", s_full), row("издержки ×2", cost2), row("исполнение на день позже", lagged)]), "",
            f"Лет выше LQDT: {beat} из {total}; доля двух лучших лет в прибыли: {bp.top2_share(s_full['yearly']):.0%}.", "",
            "### По годам (финалист / LQDT)",
            md_table(["Год", family, SAFE], [[str(y), fmt_pct(s_full["yearly"].get(y)), fmt_pct(lq_full["yearly"].get(y))]
@@ -190,29 +290,37 @@ def train_report(series, families: Sequence[str], n_random: int, capital: float,
            "неотделим от цены, поэтому налог на купоны занижен.",
            f"- Доходность LQDT в правилах — ключевая ставка ЦБ − {SAFE_SPREAD * 100:.1f} п.п.; "
            + (f"серия LQDT до {until} — синтетика по той же формуле." if until else "серия LQDT — реальные свечи."),
-           f"- Условие 4 валидации: XIRR выше бенчмарка «{br.CURRENT_NAME}» (35/45 в OFZ10Y и 10/45 в OFZ1Y).", "",
-           "## Данные", data_section(series), ""]
+           f"- Условие 4 валидации: XIRR выше бенчмарка «{br.CURRENT_NAME}» (35/45 в OFZ10Y и 10/45 в OFZ1Y).",
+           "- Индексы — цены открытия нет, исполнение по закрытию следующего торгового дня. Строка «исполнение на день "
+           "позже» в устойчивости сдвигает исполнение ещё на один торговый день.",
+           "- Первый месяц каждого окна все стратегии и бенчмарки держат кэш без доходности: первое решение — на закрытии "
+           "месяца (так устроен bt_sim).",
+           "- Издержки начисляются на все сделки, включая покупку и продажу LQDT.", "",
+           "## Данные", data_section(series, windows["TRAIN"][0]), ""]
     data = {}
     for fam in families:
         text, d = family_section(series, fam, windows, n_random, capital)
         out += [text, ""]
         data[fam] = d
+    passed = [f"{f}:{','.join(f'{k}={v}' for k, v in d['finalist'].items())}" for f, d in data.items() if d["passed"]]
     out += ["## Итог обучения",
             md_table(["Семейство", "Финалист", "VALID XIRR", "Прошёл", "Причина"],
                      [[f, _pstr(d["finalist"]), fmt_pct(d["valid"]["xirr"]), "да" if d["passed"] else "нет", "; ".join(d["why"]) or "—"]
                       for f, d in data.items()]), "",
-            "Команда для закрытого окна (только прошедшие): `bond_research.py holdout " +
-            " ".join(f"{f}:{','.join(f'{k}={v}' for k, v in d['finalist'].items())}" for f, d in data.items() if d["passed"]) + "`"]
+            ("Команда для закрытого окна (только прошедшие): `bond_research.py holdout " + " ".join(passed) + "`") if passed
+            else "Ни один финалист не прошёл VALID — закрытое окно не открывать."]
     return "\n".join(out) + "\n", data
 
 
 def holdout_report(series, finalists: List[Tuple[str, dict]], capital: float, violations: List[str], n_trials: int,
                    valid_mdd: Optional[Dict[str, float]] = None, windows: Optional[Dict[str, bp.Window]] = None) -> Tuple[str, dict]:
-    windows = windows or WINDOWS
+    windows, lag = effective_windows(series, windows)
     window = windows["HOLDOUT"]
     out = [f"# Облигационная часть: закрытое окно ({_w(window)})", ""]
     if violations:
         out += ["## Нарушение протокола"] + [f"- {v}" for v in violations] + [""]
+    if lag:
+        out += [lag, ""]
     out += [f"Сформировано {today()}. Капитал {fmt_money(capital)}. Параметры финалистов зафиксированы на TRAIN.", ""]
     bench = {m: {b: run_bench(series, b, window, capital=capital, tax_rate=t) for b in br.BENCHMARKS}
              for m, t in (("ИИС", None), ("брокерский", TAX))}
@@ -225,7 +333,9 @@ def holdout_report(series, finalists: List[Tuple[str, dict]], capital: float, vi
         vm = (valid_mdd or {}).get(name, iis["mdd"])
         v, _ = bp.verdict(iis, brk, bench["ИИС"]["LQDT"], bench["брокерский"]["LQDT"], bench["ИИС"]["RGBITR"],
                           bench["ИИС"]["равные доли"], vm, p)
-        v, text = cap_verdict(v, VERDICT_TEXT[v], iis, bench["ИИС"][br.CURRENT_NAME])
+        x = iis["xirr"] or -1
+        v2_ok = p < bp.DSR_ALPHA and x > (bench["ИИС"]["RGBITR"]["xirr"] or -1) and x > (bench["ИИС"]["равные доли"]["xirr"] or -1)
+        v, text = cap_verdict(v, VERDICT_TEXT[v], iis, bench["ИИС"][br.CURRENT_NAME], brk, bench["брокерский"][br.CURRENT_NAME], v2_ok)
         out += [f"## {name}",
                 md_table(HEAD, [row(f"{name} (ИИС)", iis), row(f"{name} (брокерский)", brk)]
                          + [row(f"{b} (ИИС)", bench["ИИС"][b], b != SAFE) for b in bench["ИИС"]]
@@ -250,6 +360,8 @@ def main() -> None:
     ap.add_argument("--capital", type=float, default=1_000_000.0)
     ap.add_argument("--refresh", action="store_true")
     ap.add_argument("--yes", action="store_true", help="holdout без подтверждения")
+    ap.add_argument("--force-finalists", action="store_true",
+                    help="holdout для не-финалиста или финалиста, не прошедшего VALID (нарушение протокола, пишется в отчёт)")
     args = ap.parse_args()
     load_env()
     series = load_series(args.refresh)
@@ -270,6 +382,7 @@ def main() -> None:
         if len(args.finalists) > 3:
             raise SystemExit("Не больше трёх финалистов на закрытом окне")
         finalists = [bp.parse_finalist(f, br.FAMILIES) for f in args.finalists]
+        forced = guard_finalists(finalists, finalists_path(), args.force_finalists)
         print("Закрытое окно облигаций открывается для:", "; ".join(f"{f} {_pstr(p)}" for f, p in finalists), file=sys.stderr)
         if not args.yes:
             try:
@@ -278,7 +391,7 @@ def main() -> None:
                 answer = ""
             if answer != "y":
                 raise SystemExit("Отменено")
-        violations = bp.record_holdout(finalists, holdout_log())
+        violations = bp.record_holdout(finalists, holdout_log()) + forced
         valid_mdd = {f"{f} {_pstr(p)}": run_family(series, f, p, VALID, capital=args.capital)["mdd"] for f, p in finalists}
         text, data = holdout_report(series, finalists, args.capital, violations, bp.holdout_trials(holdout_log()), valid_mdd)
         write_json(holdout_result_path(), {"at": today().isoformat(), "results": data["results"]})
@@ -294,7 +407,7 @@ def main() -> None:
 
 def signals(series, finalists: Dict[str, Any], holdout: Dict[str, Any]) -> Tuple[List[List[str]], Optional[Dict[str, float]], Optional[str]]:
     """Текущий сигнал каждого финалиста TRAIN. Рекомендация — только у финалиста с вердиктом 1–2 на закрытом окне."""
-    view = View(series, series[CAL]["dates"][-1], br.UNIVERSE, CAL)
+    view = View(series, data_end(series)[0], br.UNIVERSE, CAL)
     verd = {(r["family"], json.dumps(r["params"], sort_keys=True)): r["verdict"] for r in (holdout or {}).get("results", [])}
     rows: List[List[str]] = []
     best: Optional[Tuple[int, Dict[str, float], str]] = None
@@ -315,21 +428,36 @@ def signals(series, finalists: Dict[str, Any], holdout: Dict[str, Any]) -> Tuple
 
 
 def market_section(series, zcyc_now: Optional[Tuple[Optional[str], Dict[float, float]]] = None) -> str:
-    kr = series["KEYRATE"]
-    r, d_kr = kr["close"][-1], kr["dates"][-1]
-    rows = [["Ключевая ставка", fmt_pct(r, 2), str(d_kr)],
-            [f"Доходность LQDT (оценка: ставка − {SAFE_SPREAD * 100:.1f} п.п.)", fmt_pct(r - SAFE_SPREAD, 2), str(d_kr)]]
+    """Блок «Рынок сейчас»; пустой ряд даёт строку «нет данных», а не падение."""
+    no = "нет данных"
+    kr = series.get("KEYRATE") or {}
+    if kr.get("dates"):
+        r, d_kr = kr["close"][-1], kr["dates"][-1]
+        rows = [["Ключевая ставка", fmt_pct(r, 2), str(d_kr)],
+                [f"Доходность LQDT (оценка: ставка − {SAFE_SPREAD * 100:.1f} п.п.)", fmt_pct(r - SAFE_SPREAD, 2), str(d_kr)]]
+    else:
+        rows = [["Ключевая ставка", no, "—"]]
     if zcyc_now and zcyc_now[0]:
         zd, pts = zcyc_now[0], {int(t): zcyc_now[1][t] for t in mi.ZCYC_TERMS if t in zcyc_now[1]}
     else:
-        zd = str(series["ZCYC1"]["dates"][-1])
-        pts = {int(t): series[mi.ZCYC_TICKERS[t]]["close"][-1] for t in mi.ZCYC_TERMS}
+        z1 = (series.get("ZCYC1") or {}).get("dates") or []
+        zd = str(z1[-1]) if z1 else "—"
+        pts = {}
+        for t in mi.ZCYC_TERMS:
+            zs = series.get(mi.ZCYC_TICKERS[t]) or {}
+            if zs.get("dates") and str(zs["dates"][-1]) == zd:  # только точки той же даты, что и КБД 1 год
+                pts[int(t)] = zs["close"][-1]
+    if not pts:
+        rows.append(["КБД", no, "—"])
     for t, y in pts.items():
         rows.append([f"КБД {t} г.", fmt_pct(y, 2), str(zd)])
     if 1 in pts and 10 in pts:
         rows.append(["Наклон КБД: 10 лет − 1 год", f"{(pts[10] - pts[1]) * 100:+.2f} п.п.", str(zd)])
     for b in ["RGBITR"] + list(mi.BUCKETS):
-        s = series[b]
+        s = series.get(b) or {}
+        if not s.get("dates"):
+            rows.append([f"{b}: дюрация / доходность", no, "—"])
+            continue
         dur = s["duration"][-1]
         rows.append([f"{b}: дюрация / доходность", f"{'—' if dur is None else f'{dur:.1f} г.'} / {fmt_pct(s['yield'][-1], 2)}",
                      str(s["dates"][-1])])
@@ -339,13 +467,20 @@ def market_section(series, zcyc_now: Optional[Tuple[Optional[str], Dict[float, f
 def advise_report(series, finalists: Dict[str, Any], holdout: Dict[str, Any], held: List[Dict[str, Any]],
                   cand_rows: Optional[List[Dict[str, Any]]], warns: List[str], cfg_groups: Optional[List[Dict[str, Any]]],
                   zcyc_now: Optional[Tuple[Optional[str], Dict[float, float]]] = None) -> Tuple[str, Dict[str, Any]]:
-    t0 = series[CAL]["dates"][-1]
+    t0, lag = data_end(series)
+    if lag:
+        warns = [lag] + list(warns)
     sig_rows, rec, rec_name = signals(series, finalists, holdout)
     out = [f"# Облигации: советник ({today()})", "", "## Рынок сейчас", market_section(series, zcyc_now), "", "### Сигналы правил",
            md_table(["Правило", "Прошло VALID", "Вердикт HOLDOUT", "Статус", "Деление облигационной части"], sig_rows)
            if sig_rows else "Финалистов нет — запусти `bond_research.py train`.", ""]
     maturing: Dict[str, str] = {}
     hold_zero: Dict[str, List[str]] = {ba.GROUP_FIXED: [], ba.GROUP_SHORT: []}
+    cfg_group: Dict[str, str] = {}  # тикер -> облигационная группа targets.yaml, где он стоит
+    for g in cfg_groups or []:
+        if g["name"] in ba.SLEEVE_GROUPS:
+            for i in g["items"]:
+                cfg_group.setdefault(i["ticker"], g["name"])
     out.append("## Ваши облигации")
     if held:
         rows = []
@@ -353,10 +488,13 @@ def advise_report(series, finalists: Dict[str, Any], holdout: Dict[str, Any], he
             b = ba.bucket_of(h["duration_mod"], h["floater"])
             ends = [d for d in (h["maturity"], h["call"]) if d]
             end = min(ends) if ends else None
+            grp = cfg_group.get(h["ticker"]) or (ba.GROUP_FIXED if h["ofz"] and not h["floater"] else ba.GROUP_SHORT)
             if end is not None and (end - t0).days <= ba.MATURING_DAYS:
-                maturing[h["ticker"]] = FLOAT_KEY if h["floater"] else (b or "OFZ1Y")
+                # фикс-купонный выпуск заменяется выпуском корзины своей группы: у гасящейся бумаги дюрация уже короткая,
+                # и по ней выпуск из группы длинных ОФЗ искал бы замену в OFZ1Y
+                maturing[h["ticker"]] = FLOAT_KEY if h["floater"] else ba.GROUP_TO_BUCKET[grp]
             # гасящийся выпуск тоже остаётся в группе с весом 0: deploy не должен считать его «чужим» и не докупает
-            hold_zero[ba.GROUP_FIXED if h["ofz"] and not h["floater"] else ba.GROUP_SHORT].append(h["ticker"])
+            hold_zero[grp].append(h["ticker"])
             rows.append([h["ticker"], (h["name"] or "")[:30], fmt_money(h["value_rub"]),
                          "флоатер" if h["floater"] else fmt_pct(h["ytm"]),
                          "—" if h["duration_mod"] is None else f"{h['duration_mod']:.1f}", ba.BUCKET_RU.get(b or "", "—"),
@@ -391,14 +529,28 @@ def advise_report(series, finalists: Dict[str, Any], holdout: Dict[str, Any], he
     if any(fresh(r) for r in fl):
         repl[FLOAT_KEY] = [r["ticker"] for r in fl if fresh(r)]  # флоатер заменяет только флоатер
     if rec:
-        sleeve = (ba.current_weights(cfg_groups)[1] if cfg_groups else 0.0) or 50.0
+        sleeve = ba.current_weights(cfg_groups)[1] if cfg_groups else 0.0
+        cash_g = next((g for g in cfg_groups or [] if g["name"] == ba.GROUP_CASH), None)
+        notes = []
+        if sleeve <= 0:
+            sleeve = SLEEVE_DEFAULT
+            if not cfg_groups:
+                cash_g = {"name": ba.GROUP_CASH, "weight": CASH_DEFAULT, "items": [{"ticker": SAFE, "weight": 100.0}]}
+            notes.append(f"В targets.yaml нет облигационных групп — взята облигационная часть {SLEEVE_DEFAULT:g}%"
+                         + ("" if cfg_groups else f" и «{ba.GROUP_CASH}» {CASH_DEFAULT:g}%") + ".")
         buy = {b: repl.get(b, [])[:2] for b in ("OFZ3Y", "OFZ5Y", "OFZ10Y")}
         short = (repl.get(FLOAT_KEY) or repl.get("OFZ1Y") or [None])[0]  # группа «Флоатеры и корпоративные»: флоатер, иначе короткая ОФЗ
         buy["OFZ1Y"] = [short] if short else []
-        groups = ba.fragment_groups(rec, sleeve, buy, hold_zero)
-        notes = [f"Деление по правилу {rec_name}; облигационная часть {sleeve:g}% портфеля."]
+        groups = ba.fragment_groups(rec, sleeve, buy, hold_zero, cash_g)
+        cash0 = float(cash_g["weight"]) if cash_g else 0.0
+        notes.insert(0, f"Деление по правилу {rec_name}; облигационная часть (фикс. купон + флоатеры) {sleeve:g}% портфеля; "
+                        f"доля LQDT по правилу добавлена к текущим {cash0:g}% группы «{ba.GROUP_CASH}».")
         notes += [f"доля {b} перенесена в LQDT: нет ликвидных выпусков" for b, x in rec.items()
                   if x > 0 and b != "LQDT" and not buy.get(b)]
+        notes += ["Короткая корзина исполняется флоатером (если есть ликвидный), а в бэктесте OFZ1Y — индекс ОФЗ "
+                  "с фикс. купоном до 1 года: это не одно и то же.",
+                  "Выпуски — топ по доходности к погашению из блока «Кандидаты по корзинам»; их выбор не входит "
+                  "в проверенное правило (проверено только деление между корзинами)."]
     elif cfg_groups:
         groups, notes = ba.replace_maturing(cfg_groups, maturing, repl)
         notes.insert(0, "Проверенного правила нет — текущая структура targets.yaml, гасящиеся выпуски заменены.")

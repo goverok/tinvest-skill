@@ -113,7 +113,12 @@ def _close_before(s: Series, d: date) -> Optional[float]:
 def simulate(series: Dict[str, Series], strategy: Strategy, params: dict, *, start: date, end: date,
              universe: Optional[Sequence[str]] = None, capital: float = 1_000_000.0, cost: float = COST,
              slip: float = SLIP, tax_rate: Optional[float] = None, rebalance_threshold: float = REBALANCE_THRESHOLD,
-             fill: str = "open", rebalance: str = "daily", safe: str = "LQDT", calendar: str = "IMOEX") -> Result:
+             fill: str = "open", rebalance: str = "daily", safe: str = "LQDT", calendar: str = "IMOEX",
+             delay: int = 0) -> Result:
+    """delay — сколько торговых дней календаря заявка ждёт сверх обычного одного (0 — исполнение на следующем баре;
+    проверка устойчивости к запаздыванию исполнения). Заявка, чей бар исполнения выходит за окно, не исполняется."""
+    if delay < 0:
+        raise ValueError("delay < 0")
     cal = [d for d in series[calendar]["dates"] if start <= d <= end]
     if not cal:
         raise ValueError(f"пустой календарь: нет свечей {calendar} в окне")
@@ -126,7 +131,7 @@ def simulate(series: Dict[str, Series], strategy: Strategy, params: dict, *, sta
     gains: Dict[int, float] = {}
     carry = 0.0
     pending_div: List[Tuple[date, float]] = []   # (дата выплаты, сумма)
-    pending_target: Optional[Dict[str, float]] = None
+    pending: List[Tuple[int, Dict[str, float]]] = []   # (индекс бара исполнения в cal, цель) по порядку выставления
     state: dict = {}
     st = {"costs": 0.0, "taxes": 0.0, "dividends": 0.0}
     trades: List[Dict[str, Any]] = []
@@ -250,10 +255,9 @@ def simulate(series: Dict[str, Series], strategy: Strategy, params: dict, *, sta
         cash_min = min(cash_min, cash)
         prev_year = d.year
         prev_d = d
-        # 4. заявки, выставленные вчера
-        if pending_target is not None:
-            execute(pending_target, d, "open" if fill == "open" else "close")
-            pending_target = None
+        # 4. заявки, выставленные вчера (или delay баров назад)
+        while pending and pending[0][0] <= i:
+            execute(pending.pop(0)[1], d, "open" if fill == "open" else "close")
             cash_min = min(cash_min, cash)
         # 5. оценка на закрытии
         eq = value(d)
@@ -267,8 +271,8 @@ def simulate(series: Dict[str, Series], strategy: Strategy, params: dict, *, sta
             target = strategy(view, params, state) or {}
             if sum(target.values()) > 1.0 + 1e-9:
                 raise ValueError(f"сумма весов {sum(target.values()):.3f} > 1 на {d}")
-            if not is_last:
-                pending_target = target
+            if i + 1 + delay < len(cal):
+                pending.append((i + 1 + delay, target))
     # ликвидация
     last = cal[-1]
     for t in list(qty):

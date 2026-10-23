@@ -22,6 +22,7 @@ MATURING_DAYS = 365
 GROUP_FIXED, GROUP_SHORT, GROUP_CASH = "ОФЗ с фикс. купоном", "Флоатеры и корпоративные", "Денежный рынок"
 GROUP_BUCKETS = [(GROUP_FIXED, ["OFZ3Y", "OFZ5Y", "OFZ10Y"]), (GROUP_SHORT, ["OFZ1Y"]), (GROUP_CASH, ["LQDT"])]
 GROUP_TO_BUCKET = {GROUP_FIXED: "OFZ10Y", GROUP_SHORT: "OFZ1Y", GROUP_CASH: "LQDT"}
+SLEEVE_GROUPS = (GROUP_FIXED, GROUP_SHORT)  # облигационная часть; «Денежный рынок» в неё не входит
 
 
 def bucket_of(duration: Optional[float], floater: bool = False) -> Optional[str]:
@@ -83,10 +84,27 @@ def pick(rows: Sequence[Dict[str, Any]], top: int = TOP_N,
     return by, floaters
 
 
+def cash_with_lqdt(weight: float, items: Dict[str, float], add: float) -> Tuple[float, Dict[str, float]]:
+    """Группа «Денежный рынок» плюс add % портфеля в LQDT поверх её веса: прежние бумаги сохраняют свою долю портфеля,
+    вес группы не уменьшается, LQDT в группе есть всегда (в пустой группе — с весом 100)."""
+    iw = sum(items.values())
+    ab = {t: (w / iw * weight if iw > 0 else 0.0) for t, w in items.items()}
+    if iw <= 0:  # у группы есть вес, но веса бумаг нулевые — считаем его долей LQDT
+        ab["LQDT"] = ab.get("LQDT", 0.0) + weight
+    ab["LQDT"] = ab.get("LQDT", 0.0) + max(add, 0.0)
+    total = weight + max(add, 0.0)
+    if total <= 0:
+        return 0.0, dict({t: 0.0 for t in items}, LQDT=100.0)
+    return total, {t: a / total * 100.0 for t, a in ab.items()}
+
+
 def fragment_groups(weights: Dict[str, float], sleeve: float, buy: Dict[str, List[str]],
-                    hold_zero: Dict[str, List[str]]) -> List[Dict[str, Any]]:
+                    hold_zero: Dict[str, List[str]], cash_group: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """Облигационные группы targets.yaml: weights — доли корзин внутри облигационной части (сумма 1), sleeve — её доля
-    портфеля в %, buy — тикеры для покупки по корзинам, hold_zero — держим, но не докупаем (вес 0) по группам."""
+    портфеля в % (группы «ОФЗ с фикс. купоном» + «Флоатеры и корпоративные»), buy — тикеры для покупки по корзинам,
+    hold_zero — держим, но не докупаем (вес 0) по группам, cash_group — текущая группа «Денежный рынок».
+    Доля LQDT по правилу (и доля корзины без ликвидного выпуска) добавляется к текущему весу «Денежного рынка»,
+    поэтому сумма трёх групп = sleeve + текущий вес «Денежного рынка»."""
     weights = dict(weights)
     for b in list(weights):  # доля корзины без ликвидного выпуска уходит в LQDT: deploy нормирует состав внутри группы
         if b != "LQDT" and weights[b] > 0 and not buy.get(b):
@@ -95,15 +113,21 @@ def fragment_groups(weights: Dict[str, float], sleeve: float, buy: Dict[str, Lis
     out = []
     bought = set()
     for name, buckets in GROUP_BUCKETS:
-        gw = sum(weights.get(b, 0.0) for b in buckets)
-        items: Dict[str, float] = {}
-        for b in buckets:
-            tickers = ["LQDT"] if b == "LQDT" else list(buy.get(b, []))
-            if gw > 0 and weights.get(b, 0.0) > 0 and tickers:
-                for t in tickers:
-                    items[t] = items.get(t, 0.0) + weights[b] / gw / len(tickers) * 100.0
+        if name == GROUP_CASH:
+            cw0 = float(cash_group["weight"]) if cash_group else 0.0
+            ci0 = {i["ticker"]: float(i["weight"]) for i in cash_group["items"]} if cash_group else {}
+            gw_abs, items = cash_with_lqdt(cw0, ci0, weights.get("LQDT", 0.0) * sleeve)
+        else:
+            gw = sum(weights.get(b, 0.0) for b in buckets)
+            items = {}
+            for b in buckets:
+                tickers = list(buy.get(b, []))
+                if gw > 0 and weights.get(b, 0.0) > 0 and tickers:
+                    for t in tickers:
+                        items[t] = items.get(t, 0.0) + weights[b] / gw / len(tickers) * 100.0
+            gw_abs = gw * sleeve
         bought |= {t for t, w in items.items() if w > 0}
-        out.append({"name": name, "weight": gw * sleeve, "items": items})
+        out.append({"name": name, "weight": gw_abs, "items": items})
     for g in out:  # держим, но не докупаем; выпуск, который покупается в другой группе, второй раз не пишем
         for t in hold_zero.get(g["name"], []):
             if t not in bought:
@@ -130,11 +154,12 @@ def render_groups(groups: Sequence[Dict[str, Any]]) -> str:
 
 
 def current_weights(groups: Sequence[Dict[str, Any]]) -> Tuple[Dict[str, float], float]:
-    """Группы targets.yaml -> (доли корзин внутри облигационной части, облигационная часть в % портфеля)."""
+    """Группы targets.yaml -> (доли корзин внутри облигационной части, облигационная часть в % портфеля).
+    Облигационная часть — «ОФЗ с фикс. купоном» + «Флоатеры и корпоративные», без «Денежного рынка»."""
     w: Dict[str, float] = {}
     for g in groups:
-        b = GROUP_TO_BUCKET.get(g["name"])
-        if b:
+        if g["name"] in SLEEVE_GROUPS:
+            b = GROUP_TO_BUCKET[g["name"]]
             w[b] = w.get(b, 0.0) + float(g["weight"])
     sleeve = sum(w.values())
     return ({b: v / sleeve for b, v in w.items()} if sleeve > 0 else {}), sleeve
@@ -144,9 +169,9 @@ def replace_maturing(groups: Sequence[Dict[str, Any]], maturing: Dict[str, str],
                      repl: Dict[str, List[str]]) -> Tuple[List[Dict[str, Any]], List[str]]:
     """Облигационные группы targets.yaml, где гасящийся выпуск всегда заканчивает с весом 0: вес переходит первому
     подходящему кандидату его корзины (repl: корзина -> тикеры по убыванию предпочтения; кандидат, который сам гасится
-    или уже стоит в другой группе, пропускается), а если такого нет — уходит в LQDT группы «Денежный рынок».
-    Решения по всем выпускам группы принимаются от исходных весов и применяются одним проходом, поэтому порядок строк
-    на результат не влияет. Остальные группы не возвращаются."""
+    или уже стоит в другой группе, пропускается), а если такого нет — уходит в LQDT группы «Денежный рынок» поверх её
+    веса. Решения по всем выпускам группы принимаются от исходных весов и применяются одним проходом, поэтому порядок
+    строк на результат не влияет. «Денежный рынок» возвращается всегда и всегда с LQDT; остальные группы — нет."""
     bond = [g for g in groups if g["name"] in GROUP_TO_BUCKET]
     st = {g["name"]: {"weight": float(g["weight"]), "items": {i["ticker"]: float(i["weight"]) for i in g["items"]}} for g in bond}
     holder: Dict[str, str] = {}
@@ -194,12 +219,7 @@ def replace_maturing(groups: Sequence[Dict[str, Any]], maturing: Dict[str, str],
                 notes.append(head + "доля перенесена в LQDT: нет подходящей замены")
             else:
                 notes.append(head + "вес обнулён: нет подходящей замены, а группа без веса — переносить нечего")
-    if to_cash > 0:
-        cash = st.setdefault(GROUP_CASH, {"weight": 0.0, "items": {}})
-        iw = sum(cash["items"].values())
-        ab = {t: (w / iw * cash["weight"] if iw > 0 else 0.0) for t, w in cash["items"].items()}
-        ab["LQDT"] = ab.get("LQDT", 0.0) + to_cash
-        cash["weight"] += to_cash
-        cash["items"] = {t: a / cash["weight"] * 100.0 for t, a in ab.items()}
+    cash = st.setdefault(GROUP_CASH, {"weight": 0.0, "items": {}})
+    cash["weight"], cash["items"] = cash_with_lqdt(cash["weight"], cash["items"], to_cash)
     out = [{"name": n, "weight": s["weight"], "items": [{"ticker": t, "weight": w} for t, w in s["items"].items()]} for n, s in st.items()]
     return out, notes
