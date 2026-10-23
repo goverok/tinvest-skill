@@ -382,12 +382,17 @@ def advise_report(series, finalists: Dict[str, Any], holdout: Dict[str, Any], he
                          [[r["ticker"], f"{r['next_coupon'][0]}: {fmt_money(r['next_coupon'][1], digits=2)}"
                            if r.get("next_coupon") and r["next_coupon"][1] else "—",
                            str(r["maturity"]), fmt_money(r["turnover"])] for r in fl]) if fl else "Ликвидных флоатеров нет.", ""]
-    repl = {b: [r["ticker"] for r in v] for b, v in by.items() if v}  # заменители фикс-купонного выпуска — только фикс-купонные
-    if fl:
-        repl[FLOAT_KEY] = [r["ticker"] for r in fl]  # флоатер заменяет только флоатер
+    def fresh(r: Dict[str, Any]) -> bool:
+        """Покупаем только то, что само не гасится и не оферта в ближайшие 12 месяцев — иначе выпуск сразу попадёт в гасящиеся."""
+        end = min(d for d in (r["maturity"], r.get("call")) if d)
+        return r["ticker"] not in maturing and (end - t0).days > ba.MATURING_DAYS
+    repl = {b: [r["ticker"] for r in v if fresh(r)] for b, v in by.items()}  # заменители фикс-купонного выпуска — только фикс-купонные
+    repl = {b: v for b, v in repl.items() if v}
+    if any(fresh(r) for r in fl):
+        repl[FLOAT_KEY] = [r["ticker"] for r in fl if fresh(r)]  # флоатер заменяет только флоатер
     if rec:
         sleeve = (ba.current_weights(cfg_groups)[1] if cfg_groups else 0.0) or 50.0
-        buy = {b: [r["ticker"] for r in by.get(b, [])[:2]] for b in ("OFZ3Y", "OFZ5Y", "OFZ10Y")}
+        buy = {b: repl.get(b, [])[:2] for b in ("OFZ3Y", "OFZ5Y", "OFZ10Y")}
         short = (repl.get(FLOAT_KEY) or repl.get("OFZ1Y") or [None])[0]  # группа «Флоатеры и корпоративные»: флоатер, иначе короткая ОФЗ
         buy["OFZ1Y"] = [short] if short else []
         groups = ba.fragment_groups(rec, sleeve, buy, hold_zero)

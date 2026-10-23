@@ -143,8 +143,10 @@ def current_weights(groups: Sequence[Dict[str, Any]]) -> Tuple[Dict[str, float],
 def replace_maturing(groups: Sequence[Dict[str, Any]], maturing: Dict[str, str],
                      repl: Dict[str, List[str]]) -> Tuple[List[Dict[str, Any]], List[str]]:
     """Облигационные группы targets.yaml, где гасящийся выпуск всегда заканчивает с весом 0: вес переходит первому
-    подходящему кандидату его корзины (repl: корзина -> тикеры по убыванию предпочтения; тикер, уже стоящий в другой
-    группе, пропускается), а если такого нет — уходит в LQDT группы «Денежный рынок». Остальные группы не возвращаются."""
+    подходящему кандидату его корзины (repl: корзина -> тикеры по убыванию предпочтения; кандидат, который сам гасится
+    или уже стоит в другой группе, пропускается), а если такого нет — уходит в LQDT группы «Денежный рынок».
+    Решения по всем выпускам группы принимаются от исходных весов и применяются одним проходом, поэтому порядок строк
+    на результат не влияет. Остальные группы не возвращаются."""
     bond = [g for g in groups if g["name"] in GROUP_TO_BUCKET]
     st = {g["name"]: {"weight": float(g["weight"]), "items": {i["ticker"]: float(i["weight"]) for i in g["items"]}} for g in bond}
     holder: Dict[str, str] = {}
@@ -152,37 +154,46 @@ def replace_maturing(groups: Sequence[Dict[str, Any]], maturing: Dict[str, str],
         for i in g["items"]:
             holder.setdefault(i["ticker"], g["name"])
     notes: List[str] = []
-    to_cash, shifted = 0.0, set()
-    for g in bond:
-        s = st[g["name"]]
+    to_cash = 0.0
+    for name, s in st.items():
         gw0, iw0 = s["weight"], sum(s["items"].values())
-        for t, w in list(s["items"].items()):
+        moves = []  # (гасящийся тикер, исходный вес, кандидат или None, причина пропуска первого кандидата)
+        for t, w in s["items"].items():
             if t not in maturing or w <= 0:
                 continue
             skipped, new = [], None
             for c in repl.get(maturing[t], []):
-                if c != t and holder.get(c, g["name"]) != g["name"]:
-                    skipped.append((c, holder[c]))
-                elif c != t:
+                if c in maturing:
+                    skipped.append(f"замена {c} сама гасится → ")
+                elif holder.get(c, name) != name:
+                    skipped.append(f"замена {c} уже в группе {holder[c]} → ")
+                else:
                     new = c
                     break
+            if new:
+                holder[new] = name
+            moves.append((t, w, new, skipped[0] if skipped else ""))
+        if not moves:
+            continue
+        for t, w, new, _ in moves:  # гасящийся выпуск кандидатом не бывает, поэтому исходный вес w — его единственный вес
             s["items"][t] = 0.0
-            why = f"замена {skipped[0][0]} уже в группе {skipped[0][1]} → " if skipped else ""
             if new:
                 s["items"][new] = s["items"].get(new, 0.0) + w
-                holder[new] = g["name"]
-                notes.append(f"{t} гасится в ближайшие 12 месяцев — {why}{'взят следующий кандидат ' if skipped else 'вес ' + _num(w) + ' передан '}{new}")
+        kept = sum(s["items"].values())
+        shift = gw0 * (iw0 - kept) / iw0 if iw0 > 0 else 0.0
+        if shift < 1e-9:
+            shift = 0.0
+        s["weight"], to_cash = gw0 - shift, to_cash + shift
+        if kept > 0:  # внутри группы с весом > 0 снова 100
+            s["items"] = {t: w / kept * 100.0 for t, w in s["items"].items()}
+        for t, w, new, why in moves:
+            head = f"{t} гасится в ближайшие 12 месяцев — {why}"
+            if new:
+                notes.append(head + ("взят следующий кандидат " if why else "вес " + _num(w) + " передан ") + new)
+            elif shift > 0:
+                notes.append(head + "доля перенесена в LQDT: нет подходящей замены")
             else:
-                shift = gw0 * w / iw0
-                s["weight"] -= shift
-                to_cash += shift
-                shifted.add(g["name"])
-                notes.append(f"{t} гасится в ближайшие 12 месяцев — {why}доля перенесена в LQDT: нет подходящей замены")
-    for name in shifted:  # внутри группы с весом > 0 снова 100
-        items = st[name]["items"]
-        pos = sum(items.values())
-        if pos > 0:
-            st[name]["items"] = {t: w / pos * 100.0 for t, w in items.items()}
+                notes.append(head + "вес обнулён: нет подходящей замены, а группа без веса — переносить нечего")
     if to_cash > 0:
         cash = st.setdefault(GROUP_CASH, {"weight": 0.0, "items": {}})
         iw = sum(cash["items"].values())

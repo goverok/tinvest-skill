@@ -1125,19 +1125,79 @@ def test_bond_advisor():
     assert close(sum(x["weight"] for x in new3), 50.0) and any("LQDT" in n for n in n3), (g3, n3)
     new4, _ = ba.replace_maturing(dup, {"F": "OFZ1Y"}, {"OFZ1Y": ["D"]})  # единственный кандидат занят -> тоже LQDT
     assert close({x["name"]: x for x in new4}[ba.GROUP_CASH]["weight"], 15.0)
+
+    def check_fragment(frag, maturing, sleeve):
+        """Инварианты фрагмента: гасящиеся с весом 0, сумма групп = облигационная часть, внутри групп с весом > 0 — 100,
+        тикер не повторяется."""
+        seen = []
+        for g_ in frag:
+            items = {i["ticker"]: i["weight"] for i in g_["items"]}
+            seen += list(items)
+            assert all(items[t] == 0 for t in maturing if t in items), (g_, maturing)
+            if g_["weight"] > 0:
+                assert close(sum(items.values()), 100.0), g_
+        assert close(sum(g_["weight"] for g_ in frag), sleeve), frag
+        assert len(seen) == len(set(seen)), seen
+    for frag in (groups, g2):
+        check_fragment(frag, set(), 50.0)
+    for frag in (new, new2, new3, new4):
+        check_fragment(frag, {"F"}, 50.0)
+    # два гасящихся выпуска в одной группе: гасящийся кандидат не берётся, доли считаются от исходных весов,
+    # порядок строк на результат не влияет
+    mat2 = {"A": "OFZ1Y", "B": "OFZ1Y"}
+
+    def short_cash(order, weights=(50.0, 50.0), gw=10.0):
+        return [{"name": ba.GROUP_SHORT, "weight": gw, "items": [{"ticker": t, "weight": w} for t, w in zip(order, weights)]},
+                {"name": ba.GROUP_CASH, "weight": 5.0, "items": [{"ticker": "LQDT", "weight": 100.0}]}]
+    for order in (["B", "A"], ["A", "B"]):
+        r1, n1 = ba.replace_maturing(short_cash(order), mat2, {"OFZ1Y": ["B", "C"]})  # B сам гасится -> оба уходят в C
+        d1 = {x["name"]: x for x in r1}
+        assert close(d1[ba.GROUP_SHORT]["weight"], 10.0) and {i["ticker"]: i["weight"] for i in d1[ba.GROUP_SHORT]["items"]} == {"A": 0.0, "B": 0.0, "C": 100.0}, (order, r1)
+        assert close(d1[ba.GROUP_CASH]["weight"], 5.0) and any("B" in n and "гасится" in n and "C" in n for n in n1), n1
+        check_fragment(r1, mat2, 15.0)
+        r2, n2_ = ba.replace_maturing(short_cash(order), mat2, {"OFZ1Y": ["B"]})  # единственный кандидат гасится -> всё в LQDT
+        d2 = {x["name"]: x for x in r2}
+        assert close(d2[ba.GROUP_SHORT]["weight"], 0.0) and {i["ticker"]: i["weight"] for i in d2[ba.GROUP_SHORT]["items"]} == {"A": 0.0, "B": 0.0}, (order, r2)
+        assert close(d2[ba.GROUP_CASH]["weight"], 15.0) and {i["ticker"]: i["weight"] for i in d2[ba.GROUP_CASH]["items"]} == {"LQDT": 100.0}
+        assert sum("LQDT" in n for n in n2_) == 2, n2_
+        check_fragment(r2, mat2, 15.0)
+        # A -> C, B без замены: в LQDT уходит ровно доля B (10 × 50/100 = 5), остаток группы снова 100
+        r3, _ = ba.replace_maturing(short_cash(order), {"A": "OFZ1Y", "B": "FLOAT"}, {"OFZ1Y": ["C"]})
+        d3 = {x["name"]: x for x in r3}
+        assert close(d3[ba.GROUP_SHORT]["weight"], 5.0) and {i["ticker"]: i["weight"] for i in d3[ba.GROUP_SHORT]["items"]} == {"A": 0.0, "B": 0.0, "C": 100.0}, (order, r3)
+        assert close(d3[ba.GROUP_CASH]["weight"], 10.0)
+        check_fragment(r3, mat2, 15.0)
+    # группа без веса: гасящийся выпуск обнуляется, в LQDT ничего не переносится — и заметка об этом не врёт
+    r4, n4 = ba.replace_maturing(short_cash(["A"], (100.0,), gw=0.0), {"A": "OFZ1Y"}, {})
+    d4 = {x["name"]: x for x in r4}
+    assert d4[ba.GROUP_SHORT]["weight"] == 0.0 and {i["ticker"]: i["weight"] for i in d4[ba.GROUP_SHORT]["items"]} == {"A": 0.0}
+    assert close(d4[ba.GROUP_CASH]["weight"], 5.0) and len(n4) == 1 and "LQDT" not in n4[0] and "A" in n4[0], n4
+    check_fragment(r4, {"A"}, 5.0)
     # советник: сигнал финалиста с вердиктом 2 становится рекомендацией; без финалистов — текущая структура
     s = _bond_series()
     fin = {"curve": {"params": {"bucket": "OFZ10Y", "s": -0.01}, "passed": True}}
     hold = {"results": [{"family": "curve", "params": {"bucket": "OFZ10Y", "s": -0.01}, "verdict": 2}]}
     sig, rec, name = bres.signals(s, fin, hold)
     assert rec is not None and close(sum(rec.values()), 1.0) and sig[0][3] == "рекомендация", (sig, rec)
+    t_last = s["RGBITR"]["dates"][-1]
     held = [{"ticker": "F", "name": "Флоатер", "value_rub": 1000.0, "ytm": None, "duration_mod": 0.2, "floater": True,
-             "maturity": s["RGBITR"]["dates"][-1] + timedelta(days=100), "call": None, "ofz": True}]
-    text, out = bres.advise_report(s, {}, {}, held, rows, [], cur_groups)
+             "maturity": t_last + timedelta(days=100), "call": None, "ofz": True}]
+    # кандидаты, которые сами гасятся в ближайшие 12 месяцев (S) или уже гасятся в портфеле (F), в замену не идут —
+    # хотя по обороту они впереди D
+    rows2 = rows + [{"ticker": "S", "floater": True, "ytm": None, "duration": None, "turnover": 9e7, "maturity": t_last + timedelta(days=200),
+                     "next_coupon": None},
+                    {"ticker": "F", "floater": True, "ytm": None, "duration": None, "turnover": 8e7, "maturity": t_last + timedelta(days=100),
+                     "next_coupon": None}]
+    text, out = bres.advise_report(s, {}, {}, held, rows2, [], cur_groups)
     assert "Фрагмент targets.yaml" in text and "D" in text and out["weights"] is None, text
-    text, out = bres.advise_report(s, fin, hold, held, rows, ["предупреждение"], cur_groups)
+    og = {x["name"]: x for x in out["groups"]}
+    assert {i["ticker"]: i["weight"] for i in og[ba.GROUP_SHORT]["items"]} == {"F": 0.0, "D": 100.0}, og
+    check_fragment(out["groups"], {"F"}, 50.0)
+    text, out = bres.advise_report(s, fin, hold, held, rows2, ["предупреждение"], cur_groups)
     assert out["weights"] == rec and "предупреждение" in text
     assert {"ticker": "F", "weight": 0} in [i for g2 in out["groups"] for i in g2["items"]], out["groups"]  # гасящийся — с весом 0
+    assert "S" not in {i["ticker"] for g2 in out["groups"] for i in g2["items"]}, out["groups"]
+    check_fragment(out["groups"], {"F"}, 50.0)
     # collect_candidates с поддельным API
     class FakeApi:
         def list_bonds(self):
